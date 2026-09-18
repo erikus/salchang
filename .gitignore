@@ -1,0 +1,14 @@
+# Gradle / Android build output
+.gradle/
+build/
+*/build/
+local.properties
+.kotlin/
+*.apk
+*.aab
+*.iml
+.idea/
+captures/
+# Keys must never be committed
+*.pem
+*.key

@@ -1,0 +1,32 @@
+#!/bin/sh
+# salchang-statusline — Claude Code statusLine command.
+#
+# Reads the status JSON Claude Code passes on stdin, stores it on the current
+# tmux pane as the user option @salchang_meta (so the salchang Android app can
+# show it in the window's Info tab), then prints a short status line.
+#
+# Install:
+#   cp remote/salchang-statusline ~/.local/bin/ && chmod +x ~/.local/bin/salchang-statusline
+#   ~/.claude/settings.json:  "statusLine": {"type": "command", "command": "~/.local/bin/salchang-statusline"}
+#
+# Requires: tmux (>= 3.0 for pane options), jq.
+
+set -eu
+
+META_OPTION="@salchang_meta"
+META_KIND="claude-code"
+
+input=$(cat)
+
+if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    payload=$(printf '%s' "$input" | jq -c --arg kind "$META_KIND" '{kind: $kind, updated_at: (now | floor), data: .}') || payload=""
+    if [ -n "$payload" ]; then
+        tmux set-option -p -t "$TMUX_PANE" "$META_OPTION" "$payload" >/dev/null 2>&1 || true
+    fi
+fi
+
+if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$input" | jq -r '"[\(.model.display_name // "?")] \(.workspace.current_dir // .cwd // "") \(.context_window.used_percentage // 0)% ctx $\(.cost.total_cost_usd // 0 | . * 100 | round / 100)"'
+else
+    printf 'claude\n'
+fi
