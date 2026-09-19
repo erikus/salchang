@@ -80,6 +80,12 @@ private val META_DOT_SIZE = 6.dp
 private val META_DOT_SPACING = 4.dp
 private val BANNER_PADDING = 8.dp
 private val BANNER_MESSAGE_SPACING = 4.dp
+private val PREFIX_CHIP_PADDING_H = 8.dp
+private val PREFIX_CHIP_PADDING_V = 2.dp
+private val PREFIX_CHIP_MARGIN = 8.dp
+
+/** Shown in the top bar while the tmux prefix key is armed (see `SessionController.prefixArmed`). */
+private const val PREFIX_CHIP_LABEL: String = "PREFIX"
 
 private const val BANNER_URL_CLIPBOARD_LABEL: String = "url"
 
@@ -135,6 +141,7 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
     val tmux: TmuxState by controller.tmuxState.collectAsState()
     val prompt: SessionPrompt? by controller.prompt.collectAsState()
     val lastError: String? by controller.lastError.collectAsState()
+    val prefixArmed: Boolean by controller.prefixArmed.collectAsState()
     val snackbar: SnackbarHostState = remember { SnackbarHostState() }
     var subTab: Int by rememberSaveable { mutableIntStateOf(SUB_TAB_TERMINAL) }
     var windowDialog: WindowDialog? by remember { mutableStateOf(null) }
@@ -157,6 +164,7 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
                     IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") }
                 },
                 actions = {
+                    if (prefixArmed) PrefixChip()
                     when (connection) {
                         is ConnectionState.Connected -> TextButton(onClick = { controller.disconnect() }) { Text("Disconnect") }
                         is ConnectionState.Connecting, is ConnectionState.NeedsPassphrase -> Unit
@@ -237,6 +245,20 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
             dismissButton = { TextButton(onClick = { windowDialog = null }) { Text("Cancel") } },
         )
     }
+}
+
+/** Small "PREFIX" badge: the next key goes to the tmux prefix table instead of the pane. */
+@Composable
+private fun PrefixChip() {
+    Text(
+        PREFIX_CHIP_LABEL,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onPrimaryContainer,
+        modifier = Modifier
+            .padding(end = PREFIX_CHIP_MARGIN)
+            .background(MaterialTheme.colorScheme.primaryContainer, MaterialTheme.shapes.small)
+            .padding(horizontal = PREFIX_CHIP_PADDING_H, vertical = PREFIX_CHIP_PADDING_V),
+    )
 }
 
 @Composable

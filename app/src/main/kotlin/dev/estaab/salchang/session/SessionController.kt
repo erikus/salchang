@@ -16,8 +16,11 @@ import dev.estaab.salchang.tmuxctl.DEFAULT_HISTORY_LINES
 import dev.estaab.salchang.tmuxctl.TmuxCommandException
 import dev.estaab.salchang.tmuxctl.TmuxControlClient
 import dev.estaab.salchang.tmuxctl.TmuxEvent
+import dev.estaab.salchang.tmuxctl.TmuxKeyBinding
+import dev.estaab.salchang.tmuxctl.TmuxKeyRouter
 import dev.estaab.salchang.tmuxctl.TmuxPane
 import dev.estaab.salchang.tmuxctl.TmuxState
+import dev.estaab.salchang.tmuxctl.parseListKeys
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -52,6 +55,11 @@ private const val META_CACHE_SIZE: Int = 64
 
 /** Bytes of tmux stderr read (non-blocking) when the control stream dies, to explain why. */
 private const val STDERR_SNIPPET_BYTES: Int = 2_048
+
+/** Commands that load the key-binding emulation (see [SessionController.keyRouter]). */
+private const val SHOW_PREFIX_COMMAND: String = "show-options -gv prefix"
+private const val LIST_PREFIX_KEYS_COMMAND: String = "list-keys -T prefix"
+private const val LIST_ROOT_KEYS_COMMAND: String = "list-keys -T root"
 
 /**
  * One connected host: SSH transport, tmux control client and one [PaneTerminal] per pane the
@@ -89,6 +97,18 @@ class SessionController(
     private val _lastError: MutableStateFlow<String?> = MutableStateFlow(null)
     /** Non-fatal failures of window/pane commands, for a snackbar. */
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
+
+    private val _keyRouter: MutableStateFlow<TmuxKeyRouter?> = MutableStateFlow(null)
+    /**
+     * Client-side emulation of the tmux prefix and `root` key tables, loaded from the server
+     * after each connect. Null until loaded or if loading failed; typed bytes then pass
+     * through to `send-keys` unchanged (so the prefix prints literally).
+     */
+    val keyRouter: StateFlow<TmuxKeyRouter?> = _keyRouter.asStateFlow()
+
+    private val _prefixArmed: MutableStateFlow<Boolean> = MutableStateFlow(false)
+    /** True between the prefix key and the key it applies to, for a UI indicator. */
+    val prefixArmed: StateFlow<Boolean> = _prefixArmed.asStateFlow()
 
     private var client: TmuxControlClient? = null
     private var transport: SshControlTransport? = null
@@ -195,6 +215,27 @@ class SessionController(
         _connectionState.value = ConnectionState.Connected
         // The view may have reported its grid while we were connecting; tmux still has the size start() sent.
         if (clientCols != startCols || clientRows != startRows) scheduleClientSize(client)
+        loadKeyBindings(client)
+    }
+
+    /**
+     * Fills [keyRouter] from the server's prefix option and `prefix`/`root` key tables. On
+     * failure keys keep passing through unchanged and the reason lands in [lastError].
+     */
+    private suspend fun loadKeyBindings(client: TmuxControlClient) {
+        try {
+            val prefix: String = client.command(SHOW_PREFIX_COMMAND).linesOrThrow(SHOW_PREFIX_COMMAND).firstOrNull()?.trim()
+                ?: throw IOException("empty reply to $SHOW_PREFIX_COMMAND")
+            val lines: List<String> = client.command(LIST_PREFIX_KEYS_COMMAND).linesOrThrow(LIST_PREFIX_KEYS_COMMAND) +
+                client.command(LIST_ROOT_KEYS_COMMAND).linesOrThrow(LIST_ROOT_KEYS_COMMAND)
+            if (this.client !== client) return
+            _keyRouter.value = TmuxKeyRouter(prefix, parseListKeys(lines))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "loading tmux key bindings failed; keys pass through unchanged", e)
+            _lastError.value = "Key bindings unavailable: ${e.message}"
+        }
     }
 
     private suspend fun runDisconnect(reason: String) {
@@ -234,6 +275,8 @@ class SessionController(
         clientJobs.forEach { it.cancel() }
         clientJobs.clear()
         bootstraps.clear()
+        _keyRouter.value = null
+        _prefixArmed.value = false
         client?.close()
         client = null
         transport?.close()
@@ -333,16 +376,22 @@ class SessionController(
         val client: TmuxControlClient = this.client ?: return null
         val pane: TmuxPane = _tmuxState.value.pane(paneId) ?: return null
         val sessionClient = PaneSessionClient(copyToClipboard)
+        // The sink runs on the main thread: TerminalView writes typed keys from its key handlers,
+        // and the emulator's own replies are written while it processes output in handleEvent.
+        // That is what lets the (single, shared) router keep its prefix state without locking.
         val sink = TerminalSink { data, offset, count ->
             val copy: ByteArray = data.copyOfRange(offset, offset + count)
-            // Launch order == keysMutex acquisition order, so typed bytes stay in sequence.
-            scope.launch {
-                try {
-                    client.sendKeys(paneId, copy)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.w(LOG_TAG, "send-keys to $paneId failed", e)
+            val router: TmuxKeyRouter? = _keyRouter.value
+            if (router == null) {
+                sendBytes(client, paneId, copy)
+                return@TerminalSink
+            }
+            val actions: List<TmuxKeyRouter.Action> = router.route(copy)
+            _prefixArmed.value = router.armed
+            for (action in actions) {
+                when (action) {
+                    is TmuxKeyRouter.Action.Send -> sendBytes(client, paneId, action.bytes)
+                    is TmuxKeyRouter.Action.Run -> runBinding(client, action.binding)
                 }
             }
         }
@@ -355,6 +404,36 @@ class SessionController(
         _terminals.value = _terminals.value + (paneId to terminal)
         scope.launch { bootstrap(client, terminal) }
         return terminal
+    }
+
+    /**
+     * Types [bytes] into [paneId]. Launch order == the client's key-mutex acquisition order, so
+     * typed bytes and bound commands ([runBinding]) reach tmux in the sequence they were typed.
+     */
+    private fun sendBytes(client: TmuxControlClient, paneId: String, bytes: ByteArray) {
+        scope.launch {
+            try {
+                client.sendKeys(paneId, bytes)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(LOG_TAG, "send-keys to $paneId failed", e)
+            }
+        }
+    }
+
+    /** Runs the command of a matched key binding; a tmux error is reported as "<key>: <error>". */
+    private fun runBinding(client: TmuxControlClient, binding: TmuxKeyBinding) {
+        scope.launch {
+            try {
+                val result: CommandResult = client.commandInKeyOrder(binding.command)
+                if (result is CommandResult.Error) _lastError.value = "${binding.key}: ${result.lines.joinToString(" | ")}"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _lastError.value = "${binding.key}: ${e.message}"
+            }
+        }
     }
 
     /** One pane's in-flight bootstrap: the capture reply is expected first, then the cursor/history reply. */
@@ -514,6 +593,11 @@ class SessionController(
         }
 
         private fun describe(cause: Throwable): String = cause.message?.takeIf { it.isNotBlank() } ?: cause.javaClass.simpleName
+
+        private fun CommandResult.linesOrThrow(command: String): List<String> = when (this) {
+            is CommandResult.Success -> lines
+            is CommandResult.Error -> throw TmuxCommandException(command, lines)
+        }
 
         /** Whatever tmux wrote to stderr so far, without blocking. */
         private suspend fun readStderr(transport: SshControlTransport): String = withContext(Dispatchers.IO) {

@@ -6,6 +6,7 @@ import android.graphics.Typeface
 import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.View
 import android.view.inputmethod.InputMethodManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -194,6 +195,10 @@ private fun PaneView(
                 TerminalView(context, null).apply {
                     isFocusable = true
                     isFocusableInTouchMode = true
+                    // The view is recreated whenever the active pane changes (its emulator does not
+                    // exist until ensureTerminal ran). Without this, Android moves focus to the first
+                    // focusable Compose node (the back button) and typed keys go nowhere.
+                    addOnAttachStateChangeListener(FocusOnAttach)
                     setTerminalViewClient(PaneViewClient(this, modifiers))
                     onViewCreated(this)
                 }
@@ -223,6 +228,15 @@ private fun PaneView(
             },
         )
     }
+}
+
+/** Gives a freshly attached terminal view keyboard focus so it receives typed keys immediately. */
+private object FocusOnAttach : View.OnAttachStateChangeListener {
+    override fun onViewAttachedToWindow(v: View) {
+        v.requestFocus()
+    }
+
+    override fun onViewDetachedFromWindow(v: View) = Unit
 }
 
 /**

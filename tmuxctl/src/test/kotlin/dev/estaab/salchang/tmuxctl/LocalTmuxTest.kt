@@ -229,6 +229,33 @@ class LocalTmuxTest {
     }
 
     @Test
+    fun commandInKeyOrderSurvivesNestedReplyBlocks() = runBlocking {
+        // A `;` list and an if-shell -F branch each answer with one block per nested command;
+        // the fence must swallow the extra blocks so the next command still gets its own reply.
+        val list = client.commandInKeyOrder("display-message -p one ; display-message -p two")
+        assertEquals(CommandResult.Success(listOf("one")), list)
+        val nested = client.commandInKeyOrder("if-shell -F 1 \"display-message -p a ; display-message -p b\"")
+        assertTrue(nested.toString(), nested is CommandResult.Success)
+        assertEquals(CommandResult.Success(listOf("after")), client.command("display-message -p after"))
+        val failed = client.commandInKeyOrder("kill-window -t @999")
+        assertTrue(failed.toString(), failed is CommandResult.Error)
+        assertEquals(CommandResult.Success(listOf("still in sync")), client.command("display-message -p 'still in sync'"))
+
+        // The server's own prefix table parses and a binding's command runs as printed.
+        val (code, listed) = tmux("list-keys", "-T", "prefix")
+        assertEquals(listed, 0, code)
+        val bindings = parseListKeys(listed.lines())
+        val newWindow = bindings.first { it.table == PREFIX_TABLE && it.key == "c" }
+        assertEquals("new-window", newWindow.command)
+        assertEquals("last-window", bindings.first { it.key == "l" }.command)
+        val before = client.state.value.windows.size
+        val run = client.commandInKeyOrder(newWindow.command)
+        assertTrue(run.toString(), run is CommandResult.Success)
+        awaitState("window added by binding") { it.windows.size == before + 1 }
+        Unit
+    }
+
+    @Test
     fun serverExitProducesExitEvent() = runBlocking {
         tmux("kill-server")
         val event = awaitEvent<TmuxEvent>(TEST_TIMEOUT_MS) { it is TmuxEvent.Exit || it is TmuxEvent.TransportError }

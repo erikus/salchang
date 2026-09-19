@@ -41,6 +41,7 @@ fun SalchangNavHost(app: SalchangApp) {
                 hostId = null,
                 repository = app.hostRepository,
                 keyStore = app.keyStore,
+                knownHostsFactory = { prompt -> app.knownHosts(prompt) },
                 onDone = { navController.popBackStack() },
             )
         }
@@ -52,6 +53,7 @@ fun SalchangNavHost(app: SalchangApp) {
                 hostId = entry.arguments?.getString(Routes.ARG_HOST_ID),
                 repository = app.hostRepository,
                 keyStore = app.keyStore,
+                knownHostsFactory = { prompt -> app.knownHosts(prompt) },
                 onDone = { navController.popBackStack() },
             )
         }

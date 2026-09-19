@@ -60,6 +60,9 @@ private const val TRUE_FLAG: String = "1"
 
 /** Error text delivered for a reply block that tmux abandoned by starting another `%begin`. */
 internal const val BLOCK_INTERRUPTED_MESSAGE: String = "reply block interrupted by %begin"
+
+/** Prefix of the text echoed by the fence command of [TmuxControlClient.commandInKeyOrder]. */
+private const val FENCE_PREFIX: String = "salchang-fence-"
 private const val NEWLINE: Byte = '\n'.code.toByte()
 private const val CARRIAGE_RETURN: Byte = '\r'.code.toByte()
 
@@ -298,6 +301,30 @@ class TmuxControlClient(
     }
 
     /**
+     * Runs a key-binding command [line] (as printed by `list-keys`) in order with [sendKeys]
+     * and returns the reply to the line itself.
+     *
+     * Unlike [command] this tolerates lines that produce more than one reply block: tmux emits
+     * a `%begin`..`%end` block per command of a `;` list and per command run by `if-shell -F`
+     * or a `display-menu`, all flagged as ours. A fence command (`display-message` echoing a
+     * unique token) is written right after [line]; blocks arriving before the fence's own reply
+     * are discarded instead of being matched to later commands. Commands whose nested commands
+     * run asynchronously (`run-shell`, `if-shell` with a shell command) can still emit blocks
+     * after the fence; those are matched to whatever is pending, as with [command].
+     */
+    suspend fun commandInKeyOrder(line: String): CommandResult {
+        val fence = Pending.Fence(FENCE_PREFIX + nextToken.getAndIncrement(), CompletableDeferred())
+        val reply: Deferred<CommandResult> = keysMutex.withLock {
+            val deferred: Deferred<CommandResult> = submit(line)
+            submit("display-message -p '${fence.text}'", fence)
+            deferred
+        }
+        val result: CommandResult = reply.await()
+        fence.done.await()
+        return result
+    }
+
+    /**
      * Returns the pane's visible screen plus [historyLines] of scrollback, with SGR
      * escapes (`-e`), wrapped lines joined (`-J`) and trailing spaces kept (`-N`), as
      * lines joined by CR LF. Trailing fully empty lines are dropped so replaying the
@@ -372,6 +399,12 @@ class TmuxControlClient(
     private sealed interface Pending {
         class Awaited(val deferred: CompletableDeferred<CommandResult>) : Pending
         class Tracked(val token: Long) : Pending
+
+        /**
+         * Stays at the head of the queue, swallowing blocks, until the block echoing [text]
+         * arrives (see [commandInKeyOrder]).
+         */
+        class Fence(val text: String, val done: CompletableDeferred<Unit>) : Pending
     }
 
     private suspend fun submit(line: String): Deferred<CommandResult> {
@@ -398,7 +431,10 @@ class TmuxControlClient(
         }
     }
 
-    private fun takePending(): Pending? = synchronized(pending) { pending.removeFirstOrNull() }
+    /** The entry the next reply block belongs to; a [Pending.Fence] is left in place until its echo arrives. */
+    private fun takePending(): Pending? = synchronized(pending) {
+        if (pending.firstOrNull() is Pending.Fence) pending.first() else pending.removeFirstOrNull()
+    }
 
     private fun failPending(cause: Throwable) {
         val stale = synchronized(pending) {
@@ -406,7 +442,13 @@ class TmuxControlClient(
             pending.clear()
             copy
         }
-        for (entry in stale) if (entry is Pending.Awaited) entry.deferred.completeExceptionally(cause)
+        for (entry in stale) {
+            when (entry) {
+                is Pending.Awaited -> entry.deferred.completeExceptionally(cause)
+                is Pending.Fence -> entry.done.completeExceptionally(cause)
+                is Pending.Tracked -> Unit
+            }
+        }
     }
 
     /** Delivers [result] for [entry]: completes the deferred or emits the tracked reply event. */
@@ -415,6 +457,13 @@ class TmuxControlClient(
             null -> Unit
             is Pending.Awaited -> entry.deferred.complete(result)
             is Pending.Tracked -> _events.emit(TmuxEvent.CommandReply(entry.token, result))
+            is Pending.Fence -> {
+                if (result is CommandResult.Success && result.lines == listOf(entry.text)) {
+                    synchronized(pending) { pending.remove(entry) }
+                    entry.done.complete(Unit)
+                }
+                // Any other block is a stray reply from the fenced command's nested commands: dropped.
+            }
         }
     }
 

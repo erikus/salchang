@@ -48,10 +48,18 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
    tmux set-option -p -t "$TMUX_PANE" @salchang_meta '{"kind":"note","data":{"text":"hello"}}'
    ```
 
-3. In the app, add the host (tailnet name, user, authentication, tmux session name). The app
-   attaches with `tmux -C new-session -t <session>` (a grouped session, so your
-   desktop client keeps its own current window) and kills that grouped session
-   when it disconnects.
+3. In the app, add the host (tailnet name, user, authentication, tmux session). The
+   "tmux session" field is the session *group* (or ungrouped session) name passed to
+   `new-session -t`; tap "Browse" next to it to connect once over SSH, list what the
+   host's tmux server has, and pick one instead of guessing (a wrong name silently
+   creates a new empty group). The app attaches with `tmux -C new-session -t <session>`
+   (a grouped session, so your desktop client keeps its own current window) and kills
+   that grouped session when it disconnects.
+
+Your tmux prefix key and `bind -n` (root table) bindings work as usual: the app loads them from
+the server and emulates them client-side (a `PREFIX` badge shows while the prefix is armed).
+Bindings that need tmux's interactive UI (`command-prompt`, `confirm-before`, `display-menu`,
+`choose-*`, `copy-mode`) are not supported.
 
 ## Authentication
 

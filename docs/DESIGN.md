@@ -21,6 +21,7 @@ JSON Claude Code hands to status line scripts).
 | Keys | Per host `authMethod`: `NONE` (SSH `none` method, for Tailscale SSH which authenticates by tailnet identity; a check-mode approval URL arrives as the SSH auth banner and is shown while connecting) or `KEY`. Keys: import OpenSSH private key file (SAF picker) or generate ed25519 in-app; stored in app-private storage; passphrase asked at connect time, never stored | Tailnet use; simple. |
 | Host keys | TOFU: first connect shows fingerprint, accept stores it in app-private `known_hosts` | Standard. |
 | Input | `send-keys -t %N -H <hex bytes>` only | Sidesteps all tmux quoting. |
+| Key bindings | Emulated client-side: the prefix key and the `prefix`/`root` key tables are loaded after connect (`show-options -gv prefix`, `list-keys -T prefix`, `list-keys -T root`); typed bytes are tokenized into keys, a matched binding runs its command on the control channel, everything else goes to `send-keys` | `send-keys -H` bypasses tmux's key tables, so tmux never sees the prefix (it printed literally). Interactive commands (`command-prompt`, `confirm-before`, `display-menu`, `choose-*`, `copy-mode`) do nothing useful in control mode and are not supported. |
 | Initial screen | `capture-pane -p -e -J -N -t %N -S -<history>` then live `%output` | Standard control-mode bootstrap (same as iTerm2). |
 
 ## Modules
@@ -65,6 +66,33 @@ Protocol facts (tmux 3.4, verified locally):
 - `%window-add/%window-close/%window-renamed/%session-window-changed/%window-pane-changed/%exit`.
 - On `%window-add`, `%layout-change`, `%window-renamed` we re-run `list-windows`/`list-panes -s` with tab-separated `-F` formats.
 
+#### Key bindings (`TmuxKeyBindings.kt`)
+
+- `parseListKeys` reads `bind-key [-r] -T <table> <key> <command>` lines. The key token is
+  backslash-escaped (`\"`, `\#`, `\;`, `\\`, `\{`, `\~`) or quoted (`'M-"'`, `"M-{"`); the
+  command is kept as printed except that a standalone `\;` (a `bind-key` argument separating
+  commands) becomes `;` (what a control-mode command line needs). Notes (`-N`) are not printed.
+- `TmuxKeyCodes` maps names to bytes: `C-x` control characters (`C-Space` = 0x00, tmux prints
+  `C-@`/`C-i`/`C-m`/`C-[` as `C-Space`/`Tab`/`Enter`/`Escape`), named keys (`Up`.. as CSI A-D,
+  `Home`/`End` as CSI H/F, `PPage`/`NPage`/`IC`/`DC` as CSI 5/6/2/3 `~`, F1-F4 as SS3 P-S, F5-F12
+  as CSI 15..24 `~`, `BTab` as CSI Z), `M-x` as ESC + x, `S-`/`C-` on named keys as xterm
+  `CSI 1;m X`. Input also accepts SS3 arrows/home/end (application cursor mode), `CSI 1~`/`4~`,
+  and `CSI 1;3D`-style meta (what the Termux key handler sends for Alt+arrow). Aliases tmux
+  accepts (`PgUp`, `PageUp`, `Insert`...) collapse to the printed names by round-tripping.
+- `TmuxKeyRouter` is a small state machine: prefix key → armed (shown as a `PREFIX` chip);
+  next key looked up in the `prefix` table (found → run, unbound → dropped like tmux, prefix
+  again with no binding or `send-prefix` → prefix bytes sent); unarmed keys are looked up in
+  the `root` table. `-r` bindings get no repeat timer. Bytes that are not keys (emulator
+  replies such as cursor position reports) pass through and do not disarm.
+- Bound commands run through `TmuxControlClient.commandInKeyOrder`, which takes the same mutex
+  as `send-keys` (so keys and commands reach tmux in typing order) and writes a fence
+  (`display-message -p salchang-fence-N`) after the command. Needed because a `;` list, or a
+  command like `if-shell -F` / `display-menu`, produces one `%begin`/`%end` block *per nested
+  command*, all with flag 1; the reader drops blocks until the fence's echo instead of matching
+  them to later commands. Commands whose nested commands run asynchronously (`run-shell`,
+  `if-shell` with a shell command) can still emit blocks after the fence; those are matched to
+  whatever is pending, as before.
+
 ### terminal (Android library)
 
 Vendored from termux-app commit `084d709fbf23ea83b5cb85fd3d795c775be06676` (2026-09-16), Apache-2.0
@@ -78,7 +106,7 @@ Everything under `com.termux.terminal` / `com.termux.view` otherwise unchanged.
 - `ssh/`: `SshControlTransport` — sshj `SSHClient` → exec `tmux -C new-session -t <session>` (+ optional `-L socket`/`-S path`); implements `ControlTransport`. Host key TOFU via `OpenSSHKnownHosts` in app files dir. `AndroidCrypto.install()` swaps the BC provider once at app start.
 - `data/`: `HostProfile` (name, hostname, port, user, authMethod, keyId, tmuxSession, tmuxSocket) persisted with DataStore/JSON; `KeyStore` (files dir; generate ed25519 with BC; import via SAF).
 - `session/`: `SessionController` — owns SSH + `TmuxControlClient`, one `TerminalSession`/emulator per pane, bootstraps each pane with `capturePane`, feeds `%output` bytes to emulators, forwards typed bytes to `sendKeys`, parses `@salchang_meta` JSON per pane → window meta.
-- `ui/`: `HostsScreen`, `HostEditScreen`, `SessionScreen` (top: window tab row + "+" ; per window: Terminal | Info tabs; extra-keys bar Esc/Tab/Ctrl/Alt/arrows/Home/End/PgUp/PgDn like Termux; connection banner with reconnect).
+- `ui/`: `HostsScreen`, `HostEditScreen` (its "Browse" button lists the host's tmux session groups/sessions via a one-off SSH exec of `tmux list-sessions -F ...` — `SshControlTransport.runOnce` + `buildListSessionsCommand` — and fills the tmux session field with the group or session name that `new-session -t` needs), `SessionScreen` (top: window tab row + "+" ; per window: Terminal | Info tabs; extra-keys bar Esc/Tab/Ctrl/Alt/arrows/Home/End/PgUp/PgDn like Termux; connection banner with reconnect).
 - Info tab renders the Claude Code payload: model, cwd/project, git branch/worktree, context used %, cost, duration, lines +/-, rate limits, updated-at; falls back to pretty-printed raw JSON for unknown payloads.
 
 ### remote

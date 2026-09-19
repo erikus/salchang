@@ -36,6 +36,31 @@ private const val CLOSE_THREAD_NAME: String = "salchang-ssh-close"
 class RemoteCommandFailedException(val command: String, val exitStatus: Int?, val stderr: String) :
     IOException("`$command` exited with status $exitStatus: ${stderr.trim()}")
 
+/** One line of `tmux list-sessions` as parsed by [SshControlTransport.parseListSessions]. */
+data class RemoteTmuxSession(
+    /** Session group name, null for an ungrouped session. */
+    val group: String?,
+    val name: String,
+    val windows: Int,
+    /** Number of clients attached to this session. */
+    val attached: Int,
+)
+
+/**
+ * Something `tmux new-session -t <name>` can join: a session group (all its members share the
+ * windows) or a single ungrouped session. Derived from [RemoteTmuxSession]s by
+ * [SshControlTransport.attachTargets].
+ */
+data class TmuxAttachTarget(
+    /** What to put in `HostProfile.tmuxSession`. */
+    val name: String,
+    /** True for a group; false for an ungrouped session. */
+    val grouped: Boolean,
+    /** Sessions in the group (1 for an ungrouped session). */
+    val sessions: Int,
+    val windows: Int,
+)
+
 /**
  * [ControlTransport] over an sshj exec channel running `tmux -C`.
  *
@@ -130,6 +155,24 @@ class SshControlTransport private constructor(
         private const val TMUX_SOCKET_PATH_FLAG: String = "-S"
         private const val TMUX_NEW_SESSION: String = "new-session"
         private const val TMUX_TARGET_FLAG: String = "-t"
+        private const val TMUX_LIST_SESSIONS: String = "list-sessions"
+        private const val TMUX_FORMAT_FLAG: String = "-F"
+
+        /** Column separator of [LIST_SESSIONS_FORMAT]; a literal tab, which tmux passes through. */
+        private const val LIST_SESSIONS_SEPARATOR: Char = '\t'
+
+        /** `-F` format for [buildListSessionsCommand]; columns match [RemoteTmuxSession] in order. */
+        const val LIST_SESSIONS_FORMAT: String =
+            "#{session_group}" + LIST_SESSIONS_SEPARATOR + "#{session_name}" + LIST_SESSIONS_SEPARATOR +
+                "#{session_windows}" + LIST_SESSIONS_SEPARATOR + "#{session_attached}"
+        private const val LIST_SESSIONS_COLUMNS: Int = 4
+
+        /**
+         * Substrings of tmux's stderr that mean "there is no server on this socket" (tmux 3.4:
+         * `no server running on <path>`, `error connecting to <path> (No such file or directory)`,
+         * and the transient `server exited unexpectedly` right after a `kill-server`).
+         */
+        private val NO_SERVER_MARKERS: List<String> = listOf("no server running", "error connecting", "server exited unexpectedly")
 
         /**
          * Connects, authenticates per [HostProfile.authMethod] and starts `tmux -C new-session -t <session>`.
@@ -167,7 +210,8 @@ class SshControlTransport private constructor(
 
         /**
          * Connects, runs [command] on the remote login shell, returns its stdout, and disconnects.
-         * Meant for diagnostics such as `tmux -V`. Throws [RemoteCommandFailedException] on a
+         * Meant for diagnostics such as `tmux -V` and the host editor's session list
+         * ([buildListSessionsCommand]). Throws [RemoteCommandFailedException] on a
          * non-zero exit status.
          */
         suspend fun runOnce(
@@ -199,6 +243,29 @@ class SshControlTransport private constructor(
          * single-quoted for the remote POSIX shell. Pure.
          */
         fun buildTmuxCommand(profile: HostProfile): String {
+            val args: MutableList<String> = tmuxBaseArgs(profile)
+            args += TMUX_CONTROL_FLAG
+            args += TMUX_NEW_SESSION
+            args += TMUX_TARGET_FLAG
+            args += profile.tmuxSession
+            return args.joinToString(" ") { shellQuote(it) }
+        }
+
+        /**
+         * `<tmuxBinary> [-L <name> | -S <path>] list-sessions -F '<LIST_SESSIONS_FORMAT>'` for
+         * [runOnce]; parse the stdout with [parseListSessions]. Single-quoting keeps the `#` of
+         * the format out of the remote shell's hands. Pure.
+         */
+        fun buildListSessionsCommand(profile: HostProfile): String {
+            val args: MutableList<String> = tmuxBaseArgs(profile)
+            args += TMUX_LIST_SESSIONS
+            args += TMUX_FORMAT_FLAG
+            args += LIST_SESSIONS_FORMAT
+            return args.joinToString(" ") { shellQuote(it) }
+        }
+
+        /** `<tmuxBinary>` plus the socket flag shared by every tmux invocation for [profile]. */
+        private fun tmuxBaseArgs(profile: HostProfile): MutableList<String> {
             val args: MutableList<String> = mutableListOf(profile.tmuxBinary)
             val socketPath: String? = profile.tmuxSocketPath
             val socketName: String? = profile.tmuxSocketName
@@ -209,12 +276,53 @@ class SshControlTransport private constructor(
                 args += TMUX_SOCKET_NAME_FLAG
                 args += socketName
             }
-            args += TMUX_CONTROL_FLAG
-            args += TMUX_NEW_SESSION
-            args += TMUX_TARGET_FLAG
-            args += profile.tmuxSession
-            return args.joinToString(" ") { shellQuote(it) }
+            return args
         }
+
+        /**
+         * Parses the stdout of [buildListSessionsCommand]. Blank lines are skipped; an empty
+         * group column becomes null. Throws [IllegalArgumentException] on a line that does not
+         * have exactly the expected columns or non-numeric counts. Pure.
+         */
+        fun parseListSessions(stdout: String): List<RemoteTmuxSession> =
+            stdout.lineSequence().filter { it.isNotBlank() }.map { line ->
+                val columns: List<String> = line.split(LIST_SESSIONS_SEPARATOR)
+                require(columns.size == LIST_SESSIONS_COLUMNS) {
+                    "expected $LIST_SESSIONS_COLUMNS tab-separated columns from list-sessions, got ${columns.size}: `$line`"
+                }
+                RemoteTmuxSession(
+                    group = columns[0].ifEmpty { null },
+                    name = columns[1],
+                    windows = requireNotNull(columns[2].toIntOrNull()) { "bad session_windows in `$line`" },
+                    attached = requireNotNull(columns[3].toIntOrNull()) { "bad session_attached in `$line`" },
+                )
+            }.toList()
+
+        /**
+         * Collapses [sessions] into what `new-session -t` accepts: one target per group (members
+         * share windows, so the window count is that of any member) followed by one per
+         * ungrouped session, each list in first-seen order. Pure.
+         */
+        fun attachTargets(sessions: List<RemoteTmuxSession>): List<TmuxAttachTarget> {
+            val groups: LinkedHashMap<String, MutableList<RemoteTmuxSession>> = LinkedHashMap()
+            val ungrouped: MutableList<RemoteTmuxSession> = ArrayList()
+            for (session: RemoteTmuxSession in sessions) {
+                val group: String? = session.group
+                if (group == null) ungrouped += session else groups.getOrPut(group) { ArrayList() } += session
+            }
+            val targets: MutableList<TmuxAttachTarget> = ArrayList()
+            for ((group: String, members: MutableList<RemoteTmuxSession>) in groups) {
+                targets += TmuxAttachTarget(name = group, grouped = true, sessions = members.size, windows = members.first().windows)
+            }
+            for (session: RemoteTmuxSession in ungrouped) {
+                targets += TmuxAttachTarget(name = session.name, grouped = false, sessions = 1, windows = session.windows)
+            }
+            return targets
+        }
+
+        /** True if [e] is tmux reporting that no server is listening on the profile's socket. */
+        fun isNoServerError(e: RemoteCommandFailedException): Boolean =
+            NO_SERVER_MARKERS.any { marker -> e.stderr.contains(marker) }
 
         /** POSIX single-quoting: `'` becomes `'\''`, everything else is literal. */
         fun shellQuote(arg: String): String = "'" + arg.replace("'", "'\\''") + "'"
