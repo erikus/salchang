@@ -220,6 +220,29 @@ class LocalTmuxTest {
     }
 
     @Test
+    fun statusLabelFollowsServerFormatAndPanePath() = runBlocking {
+        val window = client.state.value.windows.first()
+        // tmux's default format, expanded: "0:bash*" (index:name + current flag).
+        assertEquals("${window.index}:${window.name}*", window.statusLabel.trim())
+        assertEquals("${window.index}:${window.name}*", window.tabLabel())
+
+        // A user-style format: user option expanded with E:, path basename, and a style directive.
+        tmux("set-option", "-g", "@marker", "#{?#{==:#{pane_current_command},bash},>,}")
+        tmux("set-option", "-g", "window-status-format", "#[fg=black,bold]#I:#{E:@marker}#{b:pane_current_path}#F ")
+        client.refresh()
+        val cwd = File(".").absoluteFile.normalize().name
+        val refreshed = awaitState("label after format change") {
+            it.window(window.id)?.statusLabel == "#[fg=black,bold]${window.index}:>$cwd* "
+        }
+        assertEquals("${window.index}:>$cwd*", refreshed.window(window.id)!!.tabLabel())
+
+        // Changing directory has no notification of its own; the subscription must carry it.
+        client.sendKeys(window.activePaneId!!, "cd /\n".toByteArray())
+        awaitState("label after cd") { it.window(window.id)?.statusLabel == "#[fg=black,bold]${window.index}:>/* " }
+        Unit
+    }
+
+    @Test
     fun commandErrorsAreReported() = runBlocking {
         val result = client.command("kill-window -t @999")
         assertTrue(result.toString(), result is CommandResult.Error)

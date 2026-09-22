@@ -35,6 +35,15 @@ const val META_OPTION: String = "@salchang_meta"
 /** Name given to the `refresh-client -B` subscription for [META_OPTION]. */
 const val META_SUBSCRIPTION_NAME: String = "meta"
 
+/**
+ * Format yielding [TmuxWindow.statusLabel]: the server's `window-status-format` option expanded
+ * for the target window (the `T:` modifier, tmux >= 3.2; older servers expand it to nothing).
+ */
+const val STATUS_LABEL_FORMAT: String = "#{T:window-status-format}"
+
+/** Name given to the per-window `refresh-client -B` subscription for [STATUS_LABEL_FORMAT]. */
+const val STATUS_LABEL_SUBSCRIPTION_NAME: String = "tab"
+
 /** Events buffered between the reader and a slow collector before the reader suspends. */
 private const val EVENT_BUFFER_CAPACITY: Int = 4096
 
@@ -192,13 +201,17 @@ class TmuxControlClient(
     }
 
     /**
-     * Tells tmux our client size, subscribes to [META_OPTION] changes on every pane,
-     * and performs the first [refresh]. Subscribe to [events] before calling this.
+     * Tells tmux our client size, subscribes to [META_OPTION] changes on every pane and to the
+     * rendered status label of every window, and performs the first [refresh]. Subscribe to
+     * [events] before calling this.
      */
     suspend fun start(clientCols: Int, clientRows: Int) {
         setClientSize(clientCols, clientRows)
         // Single quotes: '#' would otherwise start a comment.
         command("refresh-client -B '$META_SUBSCRIPTION_NAME:%*:#{$META_OPTION}'").orThrow()
+        // tmux re-evaluates this itself (rate-limited to ~1/s) whenever the expansion changes, e.g.
+        // when a pane's current command or path changes, which no other notification reports.
+        command("refresh-client -B '$STATUS_LABEL_SUBSCRIPTION_NAME:@*:$STATUS_LABEL_FORMAT'").orThrow()
         refresh()
     }
 
@@ -214,11 +227,14 @@ class TmuxControlClient(
             val windowsDeferred = submit("list-windows -F '#{window_id}$sep#{window_index}$sep#{window_active}$sep#{window_layout}$sep#{window_name}'")
             val panesDeferred = submit("list-panes -s -F '#{pane_id}$sep#{window_id}$sep#{pane_width}$sep#{pane_height}$sep#{pane_active}$sep#{pane_current_command}$sep#{pane_title}'")
             val metaDeferred = submit("list-panes -s -F '#{pane_id}$sep#{$META_OPTION}'")
+            // Separate command: the expanded label is free text, like the window name above.
+            val labelsDeferred = submit("list-windows -F '#{window_id}$sep$STATUS_LABEL_FORMAT'")
             val sessionDeferred = submit("display-message -p '#{session_id}$sep#{session_name}'")
 
             val windowLines = windowsDeferred.await().orThrow("list-windows")
             val paneLines = panesDeferred.await().orThrow("list-panes")
             val metaLines = metaDeferred.await().orThrow("list-panes (meta)")
+            val labelLines = labelsDeferred.await().orThrow("list-windows (labels)")
             val sessionLines = sessionDeferred.await().orThrow("display-message")
 
             val panesByWindow = HashMap<String, MutableList<TmuxPane>>()
@@ -241,6 +257,12 @@ class TmuxControlClient(
             for (line in metaLines) {
                 val f = line.split(FIELD_SEPARATOR, limit = 2)
                 if (f.size == 2 && f[1].isNotEmpty()) fetchedMeta[f[0]] = f[1]
+            }
+
+            val fetchedLabels = HashMap<String, String>()
+            for (line in labelLines) {
+                val f = line.split(FIELD_SEPARATOR, limit = 2)
+                if (f.size == 2) fetchedLabels[f[0]] = f[1]
             }
 
             val sessionFields = sessionLines.firstOrNull()?.split(FIELD_SEPARATOR, limit = 2)
@@ -271,6 +293,7 @@ class TmuxControlClient(
                         activePaneId = panes.firstOrNull { it.active }?.id,
                         panes = panes,
                         meta = panes.mapNotNull { p -> metaByPane[p.id]?.let { p.id to it } }.toMap(),
+                        statusLabel = fetchedLabels[f[0]] ?: "",
                     )
                 }.sortedBy { it.index }
                 _state.value = TmuxState(
@@ -522,9 +545,13 @@ class TmuxControlClient(
             is ControlLine.SubscriptionChanged -> {
                 val paneId = line.paneId
                 val windowId = line.windowId
-                if (line.name == META_SUBSCRIPTION_NAME && paneId != null && windowId != null) {
-                    updateMeta(paneId, windowId, line.value)
-                    _events.emit(TmuxEvent.MetaChanged(paneId, windowId, line.value))
+                when {
+                    line.name == META_SUBSCRIPTION_NAME && paneId != null && windowId != null -> {
+                        updateMeta(paneId, windowId, line.value)
+                        _events.emit(TmuxEvent.MetaChanged(paneId, windowId, line.value))
+                    }
+                    line.name == STATUS_LABEL_SUBSCRIPTION_NAME && windowId != null ->
+                        patchWindow(windowId) { it.copy(statusLabel = line.value) }
                 }
             }
             is ControlLine.LayoutChange -> {

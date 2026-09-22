@@ -36,7 +36,20 @@ data class TmuxWindow(
     val panes: List<TmuxPane>,
     /** Raw `@salchang_meta` value keyed by pane id (`%N`); panes without a value are absent. */
     val meta: Map<String, String>,
-)
+    /**
+     * The server's `window-status-format` expanded for this window (`#{T:window-status-format}`),
+     * exactly as tmux would draw it in its own status line, style directives included. Empty when
+     * the server could not expand it (tmux < 3.2). Use [tabLabel] for display.
+     */
+    val statusLabel: String,
+) {
+    /**
+     * Text for a tab representing this window: [statusLabel] with `#[...]` style directives
+     * removed and surrounding whitespace trimmed, or `index:name` (tmux's default format without
+     * flags) when the label is empty.
+     */
+    fun tabLabel(): String = stripStyleDirectives(statusLabel).trim().ifEmpty { "$index:$name" }
+}
 
 /** One tmux pane (`%N`). */
 data class TmuxPane(

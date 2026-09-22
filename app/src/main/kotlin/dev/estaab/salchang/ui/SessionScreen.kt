@@ -350,7 +350,7 @@ private fun WindowTabs(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "${window.index}:${window.name}",
+                    window.tabLabel(),
                     style = MaterialTheme.typography.titleSmall,
                     color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,

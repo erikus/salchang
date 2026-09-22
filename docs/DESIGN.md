@@ -53,7 +53,7 @@ class TmuxControlClient(transport: ControlTransport, scope: CoroutineScope) {
   fun close()
 }
 data class TmuxState(sessionId: String?, sessionName: String?, activeWindowId: String?, windows: List<TmuxWindow>)
-data class TmuxWindow(id, index, name, active, layout, activePaneId, panes: List<TmuxPane>, meta: String?)
+data class TmuxWindow(id, index, name, active, layout, activePaneId, panes: List<TmuxPane>, meta: Map<paneId, String>, statusLabel)
 data class TmuxPane(id, windowId, width, height, active, currentCommand, title)
 ```
 
@@ -61,6 +61,7 @@ Protocol facts (tmux 3.4, verified locally):
 - Every command → `%begin t n f` … `%end t n f` | `%error t n f`. First block after attach is unsolicited.
 - `%output %N data` with bytes < 0x20 and `\` escaped as `\ooo` octal.
 - `%subscription-changed name $S @W idx %P : value` (pane), `… idx - : value` (window).
+- `#{T:window-status-format}` (tmux >= 3.2) expands the server's `window-status-format` option for the target window, including the user's own `#{E:@…}` user options and `#[…]` styles. Subscribed per window (`refresh-client -B 'tab:@*:#{T:window-status-format}'`) tmux re-sends it when the expansion changes, e.g. on `cd` or when the pane's command changes — neither has a notification of its own.
 - `#` must be quoted in commands (`refresh-client -B 'name:%*:#{@opt}'`) — it starts a comment.
 - `%layout-change @W layout visible-layout flags` — carries pane sizes; re-list panes on it.
 - `%window-add/%window-close/%window-renamed/%session-window-changed/%window-pane-changed/%exit`.
@@ -106,7 +107,7 @@ Everything under `com.termux.terminal` / `com.termux.view` otherwise unchanged.
 - `ssh/`: `SshControlTransport` — sshj `SSHClient` → exec `tmux -C new-session -t <session>` (+ optional `-L socket`/`-S path`); implements `ControlTransport`. Host key TOFU via `OpenSSHKnownHosts` in app files dir. `AndroidCrypto.install()` swaps the BC provider once at app start.
 - `data/`: `HostProfile` (name, hostname, port, user, authMethod, keyId, tmuxSession, tmuxSocket) persisted with DataStore/JSON; `KeyStore` (files dir; generate ed25519 with BC; import via SAF).
 - `session/`: `SessionController` — owns SSH + `TmuxControlClient`, one `TerminalSession`/emulator per pane, bootstraps each pane with `capturePane`, feeds `%output` bytes to emulators, forwards typed bytes to `sendKeys`, parses `@salchang_meta` JSON per pane → window meta.
-- `ui/`: `HostsScreen`, `HostEditScreen` (its "Browse" button lists the host's tmux session groups/sessions via a one-off SSH exec of `tmux list-sessions -F ...` — `SshControlTransport.runOnce` + `buildListSessionsCommand` — and fills the tmux session field with the group or session name that `new-session -t` needs), `SessionScreen` (top: window tab row + "+" ; per window: Terminal | Info tabs; extra-keys bar Esc/Tab/Ctrl/Alt/arrows/Home/End/PgUp/PgDn like Termux; connection banner with reconnect).
+- `ui/`: `HostsScreen`, `HostEditScreen` (its "Browse" button lists the host's tmux session groups/sessions via a one-off SSH exec of `tmux list-sessions -F ...` — `SshControlTransport.runOnce` + `buildListSessionsCommand` — and fills the tmux session field with the group or session name that `new-session -t` needs), `SessionScreen` (top: window tab row + "+" — each tab shows `TmuxWindow.tabLabel()`, the server's rendered `window-status-format` with styles stripped, so the tabs match the user's own tmux status line and fall back to `index:name`; per window: Terminal | Info tabs; extra-keys bar Esc/Tab/Ctrl/Alt/arrows/Home/End/PgUp/PgDn like Termux; connection banner with reconnect).
 - Info tab renders the Claude Code payload: model, cwd/project, git branch/worktree, context used %, cost, duration, lines +/-, rate limits, updated-at; falls back to pretty-printed raw JSON for unknown payloads.
 
 ### remote

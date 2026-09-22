@@ -195,6 +195,34 @@ class TmuxControlClientTest {
     }
 
     @Test
+    fun refreshFetchesStatusLabelsAndSubscriptionPatchesThem() = runBlocking {
+        val job = async { client.refresh() }
+        awaitWritten("display-message -p")
+        val written = transport.writtenText()
+        assertTrue(written, written.contains("list-windows -F '#{window_id}\t$STATUS_LABEL_FORMAT'\n"))
+        // Replies in the order refresh() submits: windows, panes, meta, labels, session.
+        transport.feed("%begin 1 2 1\n@0\t0\t1\tlayout\tbash\n%end 1 2 1\n")
+        transport.feed("%begin 1 3 1\n%0\t@0\t80\t24\t1\tbash\ttitle\n%end 1 3 1\n")
+        transport.feed("%begin 1 4 1\n%0\t\n%end 1 4 1\n")
+        transport.feed("%begin 1 5 1\n@0\t#[fg=black,bold]0:🧠salchang* \n%end 1 5 1\n")
+        transport.feed("%begin 1 6 1\n\$1\tdemo\n%end 1 6 1\n")
+        withTimeout(TEST_TIMEOUT_MS) { job.await() }
+        assertEquals(TmuxEvent.WindowsChanged, nextEvent())
+        assertEquals("#[fg=black,bold]0:🧠salchang* ", client.state.value.window("@0")!!.statusLabel)
+        assertEquals("0:🧠salchang*", client.state.value.window("@0")!!.tabLabel())
+
+        transport.feed("%subscription-changed tab \$1 @0 0 - : 0:tmp* \n")
+        withTimeout(TEST_TIMEOUT_MS) {
+            while (client.state.value.window("@0")!!.statusLabel != "0:tmp* ") delay(POLL_INTERVAL_MS)
+        }
+        // Labels for windows we do not know are dropped rather than creating state.
+        transport.feed("%subscription-changed tab \$1 @7 7 - : 7:x \n")
+        transport.feed("%subscription-changed meta \$1 @0 0 %0 : m\n")
+        assertEquals(TmuxEvent.MetaChanged("%0", "@0", "m"), nextEvent())
+        assertEquals(listOf("@0"), client.state.value.windows.map { it.id })
+    }
+
+    @Test
     fun rejectsBadIdsAndMultilineCommands() = runBlocking {
         assertTrue(runCatching { client.sendKeys("0", byteArrayOf(1)) }.exceptionOrNull() is IllegalArgumentException)
         assertTrue(runCatching { client.killWindow("%0") }.exceptionOrNull() is IllegalArgumentException)
