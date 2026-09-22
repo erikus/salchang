@@ -34,8 +34,7 @@ From `terminal-view/src/main/res/` into `src/main/res/`:
 `drawable/text_select_handle_left_material.xml`, `drawable/text_select_handle_right_material.xml`,
 `values/strings.xml`
 
-Every file listed above except `TerminalSession.java` is byte-identical to upstream
-(verified with `diff -rq`).
+Every file above except `TerminalSession.java` is unmodified.
 
 ## Not copied
 

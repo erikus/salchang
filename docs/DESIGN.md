@@ -117,5 +117,5 @@ Everything under `com.termux.terminal` / `com.termux.view` otherwise unchanged.
 then prints a normal one-line status. Install: copy to `~/.local/bin`, set in `~/.claude/settings.json`:
 `"statusLine": {"type":"command","command":"~/.local/bin/salchang-statusline"}`.
 
-## Not in v1
-Multiple simultaneous hosts, pane layout rendering, copy-mode/scrollback UI beyond the emulator's own transcript, mouse reporting, file transfer, Tailscale-embedded networking (the Tailscale app provides the VPN).
+## Future Work
+Multiple simultaneous hosts, pane layout, copy-mode/scrollback UI beyond emulator's own transcript, mouse reporting, file transfer.
