@@ -1,0 +1,23 @@
+# Scans the full git history for leaked secrets on every push and pull request.
+# gitleaks-action picks up .gitleaks.toml from the repo root automatically.
+# This complements, not replaces, GitHub's own secret scanning + push protection,
+# which should also be enabled in the repo settings once the repo is public.
+name: gitleaks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so gitleaks can scan every commit, not just HEAD.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

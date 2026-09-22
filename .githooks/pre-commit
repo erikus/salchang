@@ -1,0 +1,20 @@
+#!/bin/sh
+# Pre-commit hook: block commits that stage secrets, using gitleaks.
+#
+# Enable it once per clone (repo-local config, not --global):
+#     git config core.hooksPath .githooks
+#
+# Uses the repo's .gitleaks.toml automatically. Fails closed: if gitleaks is
+# not installed the commit is refused rather than silently skipping the scan.
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: gitleaks is not on PATH; refusing to commit unscanned changes." >&2
+    echo "pre-commit: install it from https://github.com/gitleaks/gitleaks#installing" >&2
+    echo "pre-commit: (or bypass once with: git commit --no-verify)" >&2
+    exit 1
+fi
+
+exec gitleaks git --pre-commit --staged --redact --no-banner

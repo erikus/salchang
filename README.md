@@ -1,3 +1,5 @@
+<img src="art/icon.png" alt="salchang icon" width="128" align="right">
+
 # salchang
 
 Android client for a tmux server on another machine on your tailnet. SSH only,
@@ -73,3 +75,10 @@ Bindings that need tmux's interactive UI (`command-prompt`, `confirm-before`, `d
   key's dialog, e.g. over Tailscale SSH), or get an existing OpenSSH private key
   file onto the phone (Taildrop, USB, `adb push`) and Import it. Encrypted keys
   ask for their passphrase at connect time; it is never stored.
+
+## Development
+
+Enable the secret-scanning pre-commit hook once per clone (needs
+[gitleaks](https://github.com/gitleaks/gitleaks#installing) on your PATH):
+`git config core.hooksPath .githooks`. CI also runs gitleaks over the full
+history on every push and pull request.

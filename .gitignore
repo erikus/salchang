@@ -12,3 +12,12 @@ captures/
 # Keys must never be committed
 *.pem
 *.key
+# Release signing material and env files must never be committed
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+.env
+.env.*
+# Local scratch space (one-off scripts, notes); never tracked
+/scratch/

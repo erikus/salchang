@@ -1,0 +1,17 @@
+# gitleaks configuration (https://github.com/gitleaks/gitleaks#configuration)
+# Picked up automatically by `gitleaks` (CLI and gitleaks-action) from the repo root.
+
+title = "salchang gitleaks config"
+
+[extend]
+# Keep every rule from the built-in default config; only add allowlists below.
+useDefault = true
+
+# SshKeyFormat.kt contains the literal PEM header "-----BEGIN OPENSSH PRIVATE KEY-----"
+# as a constant used to parse/recognise key files. It is not a key. Scope the
+# allowlist to the `private-key` rule and that one path so every other rule still
+# applies to the file.
+[[allowlists]]
+description = "PEM header constant used for parsing in SshKeyFormat.kt (not a key)"
+targetRules = ["private-key"]
+paths = ['''^app/src/main/kotlin/dev/estaab/salchang/ssh/SshKeyFormat\.kt$''']
