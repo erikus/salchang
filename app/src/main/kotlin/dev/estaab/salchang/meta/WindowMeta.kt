@@ -5,40 +5,82 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.longOrNull
 
-/** `kind` value written by `remote/salchang-statusline`. */
+/** `kind` of a Claude Code session, whether written by the probe or by `remote/salchang-statusline`. */
 const val META_KIND_CLAUDE_CODE: String = "claude-code"
 
+/** `source` written by `remote/salchang-probe`. */
+const val META_SOURCE_PROBE: String = "probe"
+
+/** `source` written by `remote/salchang-statusline` (schema v2); the old hook wrote no `source`. */
+const val META_SOURCE_STATUSLINE: String = "statusline"
+
+/** `status` values a producer may report; anything else is shown verbatim. */
+const val META_STATUS_BUSY: String = "busy"
+const val META_STATUS_IDLE: String = "idle"
+
 private const val KEY_KIND: String = "kind"
+private const val KEY_SOURCE: String = "source"
 private const val KEY_UPDATED_AT: String = "updated_at"
+private const val KEY_AGENT_NAME: String = "agent_name"
+private const val KEY_VERSION: String = "version"
+private const val KEY_CWD: String = "cwd"
+private const val KEY_SESSION_ID: String = "session_id"
+private const val KEY_TITLE: String = "title"
+private const val KEY_STATUS: String = "status"
+private const val KEY_STARTED_AT: String = "started_at"
+private const val KEY_MODEL: String = "model"
+private const val KEY_MODEL_NAME: String = "model_name"
+private const val KEY_CONTEXT_USED: String = "context_used"
+private const val KEY_CONTEXT_WINDOW: String = "context_window"
+private const val KEY_COST_USD: String = "cost_usd"
 private const val KEY_DATA: String = "data"
 
 /**
- * Parsed value of the `@salchang_meta` pane option (see docs/DESIGN.md). The envelope is
- * `{"kind": <string>, "updated_at": <epoch seconds>, "data": {...}}`; only `claude-code` payloads
- * are understood in detail, everything else is kept as raw JSON for display.
+ * Parsed value of the `@salchang_meta` pane option (schema v2, see scratch/probe-spec.md and
+ * docs/DESIGN.md). One JSON object per pane with a set of common keys that every producer
+ * (`remote/salchang-probe`, `remote/salchang-statusline`, or a hand-written option) may fill,
+ * plus a free-form `data` object. Every key but `kind` is optional; missing and `null` are
+ * equivalent.
  */
 sealed interface WindowMeta {
-    /** A Claude Code status-line payload. */
-    data class ClaudeCode(
+    /**
+     * A JSON object. Common fields are null when absent. [claude] is decoded from [data] only
+     * for `kind == claude-code` payloads whose `source` is `statusline` or absent (the old hook
+     * wrote no `source`), because only then is `data` the Claude Code status-line JSON.
+     */
+    data class Payload(
+        /** Harness id (`claude-code`, `codex`, `pi`, ...); null when the producer omitted it. */
+        val kind: String?,
+        val source: String?,
+        /** Epoch seconds. */
         val updatedAt: Long?,
-        val data: ClaudeStatus,
+        val agentName: String?,
+        val version: String?,
+        val cwd: String?,
+        val sessionId: String?,
+        val title: String?,
+        /** [META_STATUS_BUSY], [META_STATUS_IDLE], or whatever the producer wrote. */
+        val status: String?,
+        /** Epoch seconds. */
+        val startedAt: Long?,
+        val model: String?,
+        val modelName: String?,
+        val contextUsed: Long?,
+        val contextWindow: Long?,
+        val costUsd: Double?,
+        val data: JsonObject?,
+        val claude: ClaudeStatus?,
         val raw: JsonObject,
     ) : WindowMeta
 
-    /** Valid JSON with an unknown (or missing) kind, or a `claude-code` payload we could not decode. */
-    data class Generic(
-        val kind: String?,
-        val updatedAt: Long?,
-        val raw: JsonElement,
-    ) : WindowMeta
-
-    /** The option value was not JSON. */
+    /** The option value was not a JSON object. */
     data class Invalid(
         val raw: String,
         val error: String,
@@ -53,6 +95,8 @@ sealed interface WindowMeta {
 
         private val prettyJson: Json = Json { prettyPrint = true }
 
+        private const val NOT_AN_OBJECT_ERROR: String = "expected a JSON object"
+
         fun parse(raw: String): WindowMeta {
             val element: JsonElement = try {
                 json.parseToJsonElement(raw)
@@ -61,25 +105,68 @@ sealed interface WindowMeta {
             } catch (e: IllegalArgumentException) {
                 return Invalid(raw, e.message ?: "invalid JSON")
             }
-            val obj: JsonObject = element as? JsonObject ?: return Generic(kind = null, updatedAt = null, raw = element)
-            val kind: String? = (obj[KEY_KIND] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
-            val updatedAt: Long? = (obj[KEY_UPDATED_AT] as? JsonPrimitive)?.let { it.longOrNull ?: it.doubleOrNull?.toLong() }
+            val obj: JsonObject = element as? JsonObject ?: return Invalid(raw, NOT_AN_OBJECT_ERROR)
+            val kind: String? = obj.string(KEY_KIND)
+            val source: String? = obj.string(KEY_SOURCE)
             val data: JsonObject? = obj[KEY_DATA] as? JsonObject
-            if (kind == META_KIND_CLAUDE_CODE && data != null) {
-                val status: ClaudeStatus? = try {
-                    json.decodeFromJsonElement(ClaudeStatus.serializer(), data)
-                } catch (e: SerializationException) {
-                    null
-                } catch (e: IllegalArgumentException) {
+            val claude: ClaudeStatus? =
+                if (kind == META_KIND_CLAUDE_CODE && data != null && (source == null || source == META_SOURCE_STATUSLINE)) {
+                    decodeClaudeStatus(data)
+                } else {
                     null
                 }
-                if (status != null) return ClaudeCode(updatedAt = updatedAt, data = status, raw = obj)
-            }
-            return Generic(kind = kind, updatedAt = updatedAt, raw = obj)
+            return Payload(
+                kind = kind,
+                source = source,
+                updatedAt = obj.epochSeconds(KEY_UPDATED_AT),
+                agentName = obj.string(KEY_AGENT_NAME),
+                version = obj.string(KEY_VERSION),
+                cwd = obj.string(KEY_CWD),
+                sessionId = obj.string(KEY_SESSION_ID),
+                title = obj.string(KEY_TITLE),
+                status = obj.string(KEY_STATUS),
+                startedAt = obj.epochSeconds(KEY_STARTED_AT),
+                model = obj.string(KEY_MODEL),
+                modelName = obj.string(KEY_MODEL_NAME),
+                contextUsed = obj.integer(KEY_CONTEXT_USED),
+                contextWindow = obj.integer(KEY_CONTEXT_WINDOW),
+                costUsd = obj.number(KEY_COST_USD),
+                data = data,
+                claude = claude,
+                raw = obj,
+            )
         }
 
         /** Pretty-printed JSON for the raw sections of the Info tab. */
         fun pretty(element: JsonElement): String = prettyJson.encodeToString(JsonElement.serializer(), element)
+
+        private fun decodeClaudeStatus(data: JsonObject): ClaudeStatus? = try {
+            json.decodeFromJsonElement(ClaudeStatus.serializer(), data)
+        } catch (e: SerializationException) {
+            null
+        } catch (e: IllegalArgumentException) {
+            null
+        }
+
+        /** The primitive at [key], or null when absent, `null`, or not a primitive. */
+        private fun JsonObject.primitive(key: String): JsonPrimitive? {
+            val value: JsonElement = this[key] ?: return null
+            if (value is JsonNull) return null
+            return value as? JsonPrimitive
+        }
+
+        /** A JSON string at [key]; numbers and booleans do not count. */
+        private fun JsonObject.string(key: String): String? = primitive(key)?.takeIf { it.isString }?.contentOrNull
+
+        /** An integer at [key]; a float is truncated (producers may write `1.7e9`). Strings do not count. */
+        private fun JsonObject.integer(key: String): Long? {
+            val p: JsonPrimitive = primitive(key)?.takeIf { !it.isString } ?: return null
+            return p.longOrNull ?: p.doubleOrNull?.toLong()
+        }
+
+        private fun JsonObject.epochSeconds(key: String): Long? = integer(key)
+
+        private fun JsonObject.number(key: String): Double? = primitive(key)?.takeIf { !it.isString }?.doubleOrNull
     }
 }
 

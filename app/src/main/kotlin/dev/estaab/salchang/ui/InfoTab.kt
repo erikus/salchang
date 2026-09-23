@@ -13,7 +13,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.ChipColors
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -34,7 +36,11 @@ import dev.estaab.salchang.meta.ClaudePullRequest
 import dev.estaab.salchang.meta.ClaudeRateLimit
 import dev.estaab.salchang.meta.ClaudeRateLimits
 import dev.estaab.salchang.meta.ClaudeStatus
+import dev.estaab.salchang.meta.ClaudeWorkspace
+import dev.estaab.salchang.meta.ClaudeWorktree
 import dev.estaab.salchang.meta.Formatters
+import dev.estaab.salchang.meta.META_STATUS_BUSY
+import dev.estaab.salchang.meta.META_STATUS_IDLE
 import dev.estaab.salchang.meta.WindowMeta
 import dev.estaab.salchang.tmuxctl.TmuxWindow
 import kotlinx.coroutines.delay
@@ -49,9 +55,19 @@ private const val CLOCK_TICK_MS: Long = 1_000L
 
 private const val PERCENT_MAX: Double = 100.0
 
-/** The Info tab for one window: parsed `@salchang_meta` of its active pane, or a hint. */
+/** Card title when the payload names neither an agent nor a kind. */
+private const val FALLBACK_TITLE: String = "Metadata"
+
+/** The example shown in the no-metadata hint. */
+private const val SET_OPTION_EXAMPLE: String = "tmux set-option -p @salchang_meta '{\"kind\":\"note\"}'"
+
+/**
+ * The Info tab for one window: parsed `@salchang_meta` of its active pane, or a hint.
+ * [probeError] is the agent probe's dependency error, if it reported one (see
+ * `SessionController.probeError`).
+ */
 @Composable
-fun InfoTab(window: TmuxWindow, parseMeta: (String) -> WindowMeta, modifier: Modifier = Modifier) {
+fun InfoTab(window: TmuxWindow, parseMeta: (String) -> WindowMeta, probeError: String?, modifier: Modifier = Modifier) {
     val raw: String? = window.activePaneId?.let { window.meta[it] } ?: window.meta.values.firstOrNull()
     val meta: WindowMeta? = raw?.let(parseMeta)
 
@@ -60,14 +76,8 @@ fun InfoTab(window: TmuxWindow, parseMeta: (String) -> WindowMeta, modifier: Mod
         verticalArrangement = Arrangement.spacedBy(SECTION_SPACING),
     ) {
         when (meta) {
-            null -> NoMetaHint()
-            is WindowMeta.ClaudeCode -> ClaudeCodeInfo(meta)
-            is WindowMeta.Generic -> {
-                InfoCard("Metadata" + (meta.kind?.let { " ($it)" } ?: "")) {
-                    if (meta.updatedAt != null) UpdatedAgo(meta.updatedAt)
-                    Text(WindowMeta.pretty(meta.raw), style = MonoTextStyle)
-                }
-            }
+            null -> NoMetaHint(probeError)
+            is WindowMeta.Payload -> PayloadInfo(meta)
             is WindowMeta.Invalid -> {
                 InfoCard("Invalid metadata") {
                     Text(meta.error, color = MaterialTheme.colorScheme.error)
@@ -79,96 +89,168 @@ fun InfoTab(window: TmuxWindow, parseMeta: (String) -> WindowMeta, modifier: Mod
 }
 
 @Composable
-private fun NoMetaHint() {
+private fun NoMetaHint(probeError: String?) {
     InfoCard("No metadata") {
-        Text("This window's pane has no @salchang_meta option.")
+        Text("No coding agent detected in this pane.")
+        if (probeError != null) {
+            Text("Agent detection is unavailable on this host:", style = MaterialTheme.typography.bodySmall)
+            Text(probeError, style = MonoTextStyle, color = MaterialTheme.colorScheme.error)
+        }
         Text(
-            "Install remote/salchang-statusline as the Claude Code status line to publish model, " +
-                "context and cost here, or set it by hand:",
+            "Claude Code users can additionally install remote/salchang-statusline as the status line " +
+                "to publish cost and rate limits here. Any pane can also set the option by hand:",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Text("tmux set-option -p @salchang_meta '{\"kind\":\"note\",\"data\":{}}'", style = MonoTextStyle)
+        Text(SET_OPTION_EXAMPLE, style = MonoTextStyle)
     }
 }
 
+/**
+ * Generic cards for every kind, then the Claude-specific cards when the payload came from the
+ * status-line hook, then the raw JSON. For old-hook payloads the common keys are absent, so the
+ * generic card falls back to the equivalent fields of the Claude status JSON; the Claude cards
+ * then skip whatever the generic cards already show.
+ */
 @Composable
-private fun ClaudeCodeInfo(meta: WindowMeta.ClaudeCode) {
-    val status: ClaudeStatus = meta.data
-    InfoCard("Claude Code") {
-        Row(horizontalArrangement = Arrangement.spacedBy(CHIP_SPACING), verticalAlignment = Alignment.CenterVertically) {
-            status.model?.let { model ->
-                AssistChip(onClick = {}, label = { Text(model.displayName ?: model.id ?: "model") })
-            }
-            status.effort?.level?.let { AssistChip(onClick = {}, label = { Text("effort: $it") }) }
-            if (status.thinking?.enabled == true) AssistChip(onClick = {}, label = { Text("thinking") })
-            if (status.fastMode == true) AssistChip(onClick = {}, label = { Text("fast") })
-        }
-        status.version?.let { KeyValue("Version", it) }
-        status.sessionName?.let { KeyValue("Session", it) }
-        status.agent?.name?.let { KeyValue("Agent", it) }
-        status.vim?.mode?.let { KeyValue("Vim mode", it) }
-        if (meta.updatedAt != null) UpdatedAgo(meta.updatedAt)
-    }
+private fun PayloadInfo(meta: WindowMeta.Payload) {
+    val claude: ClaudeStatus? = meta.claude
+    val modelLabel: String? = meta.modelName ?: meta.model ?: claude?.model?.displayName ?: claude?.model?.id
+    val version: String? = meta.version ?: claude?.version
+    val cwd: String? = meta.cwd ?: claude?.cwd ?: claude?.workspace?.currentDir
+    val title: String? = meta.title ?: claude?.sessionName
 
-    val cwd: String? = status.cwd ?: status.workspace?.currentDir
-    if (cwd != null || status.workspace != null || status.worktree != null) {
-        InfoCard("Directory") {
-            cwd?.let { Text(it, style = MonoTextStyle) }
-            status.workspace?.projectDir?.let { KeyValue("Project", it) }
-            status.workspace?.repo?.let { repo ->
-                val name: String = listOfNotNull(repo.owner, repo.name).joinToString("/")
-                if (name.isNotEmpty()) KeyValue("Repo", name)
-            }
-            status.worktree?.let { wt ->
-                wt.name?.let { KeyValue("Worktree", it) }
-                wt.branch?.let { KeyValue("Branch", it) }
-            }
-        }
+    AgentCard(meta, modelLabel = modelLabel, version = version, cwd = cwd, title = title)
+    val claudeContext: ClaudeContextWindow? = claude?.contextWindow
+    if (meta.contextUsed != null || claudeContext != null) {
+        ContextCard(meta.contextUsed, meta.contextWindow, claudeContext, claude?.exceeds200kTokens == true)
     }
+    val claudeCost: ClaudeCost? = claude?.cost
+    if (meta.costUsd != null || claudeCost != null) CostCard(meta.costUsd, claudeCost)
 
-    status.contextWindow?.let { ContextWindowCard(it, status.exceeds200kTokens == true) }
-    status.cost?.let { CostCard(it) }
-    status.rateLimits?.let { RateLimitsCard(it) }
-    status.pr?.let { PullRequestCard(it) }
+    if (claude != null) {
+        ClaudeDetailsCard(claude)
+        ClaudeDirectoryCard(claude.workspace, claude.worktree)
+        claude.rateLimits?.let { RateLimitsCard(it) }
+        claude.pr?.let { PullRequestCard(it) }
+    }
 
     RawJsonCard(meta.raw)
 }
 
 @Composable
-private fun ContextWindowCard(ctx: ClaudeContextWindow, exceeds200k: Boolean) {
-    InfoCard("Context window") {
-        val used: Double? = ctx.usedPercentage
-        if (used != null) {
-            LinearProgressIndicator(
-                progress = { (used / PERCENT_MAX).toFloat().coerceIn(0f, 1f) },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            KeyValue("Used", Formatters.formatPercent(used))
+private fun AgentCard(meta: WindowMeta.Payload, modelLabel: String?, version: String?, cwd: String?, title: String?) {
+    InfoCard(meta.agentName ?: meta.kind ?: FALLBACK_TITLE) {
+        if (modelLabel != null || meta.status != null) {
+            Row(horizontalArrangement = Arrangement.spacedBy(CHIP_SPACING), verticalAlignment = Alignment.CenterVertically) {
+                modelLabel?.let { AssistChip(onClick = {}, label = { Text(it) }) }
+                meta.status?.let { StatusChip(it) }
+            }
         }
-        ctx.remainingPercentage?.let { KeyValue("Remaining", Formatters.formatPercent(it)) }
-        ctx.contextWindowSize?.let { KeyValue("Size", Formatters.formatCount(it) + " tokens") }
-        ctx.totalInputTokens?.let { KeyValue("Input tokens", Formatters.formatCount(it)) }
-        ctx.totalOutputTokens?.let { KeyValue("Output tokens", Formatters.formatCount(it)) }
-        ctx.currentUsage?.let { usage ->
-            usage.cacheReadInputTokens?.let { KeyValue("Cache read", Formatters.formatCount(it)) }
-            usage.cacheCreationInputTokens?.let { KeyValue("Cache created", Formatters.formatCount(it)) }
+        title?.let { KeyValue("Title", it) }
+        cwd?.let { Text(it, style = MonoTextStyle) }
+        version?.let { KeyValue("Version", it) }
+        if (meta.updatedAt != null || meta.startedAt != null) Timestamps(meta.updatedAt, meta.startedAt)
+    }
+}
+
+/** `busy` and `idle` are colour-coded; any other status is shown verbatim in the default colours. */
+@Composable
+private fun StatusChip(status: String) {
+    val scheme = MaterialTheme.colorScheme
+    val colors: ChipColors = when (status) {
+        META_STATUS_BUSY -> AssistChipDefaults.assistChipColors(containerColor = scheme.tertiaryContainer, labelColor = scheme.onTertiaryContainer)
+        META_STATUS_IDLE -> AssistChipDefaults.assistChipColors(containerColor = scheme.secondaryContainer, labelColor = scheme.onSecondaryContainer)
+        else -> AssistChipDefaults.assistChipColors()
+    }
+    AssistChip(onClick = {}, label = { Text(status) }, colors = colors)
+}
+
+/**
+ * Context usage: a bar when both the common `context_used` and `context_window` are known,
+ * tokens alone when only `context_used` is; otherwise the Claude hook's percentage. The Claude
+ * detail rows that would repeat the summary are skipped.
+ */
+@Composable
+private fun ContextCard(used: Long?, window: Long?, claude: ClaudeContextWindow?, exceeds200k: Boolean) {
+    InfoCard("Context") {
+        if (used != null && window != null && window > 0L) {
+            val fraction: Double = used.toDouble() / window.toDouble()
+            LinearProgressIndicator(progress = { fraction.toFloat().coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+            KeyValue("Used", "${Formatters.formatCount(used)} / ${Formatters.formatCount(window)} tokens (${Formatters.formatPercent(fraction * PERCENT_MAX)})")
+        } else if (used != null) {
+            KeyValue("Used", Formatters.formatCount(used) + " tokens")
+            window?.let { KeyValue("Size", Formatters.formatCount(it) + " tokens") }
+        } else if (claude != null) {
+            claude.usedPercentage?.let { pct ->
+                LinearProgressIndicator(progress = { (pct / PERCENT_MAX).toFloat().coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                KeyValue("Used", Formatters.formatPercent(pct))
+            }
+            claude.remainingPercentage?.let { KeyValue("Remaining", Formatters.formatPercent(it)) }
+            claude.contextWindowSize?.let { KeyValue("Size", Formatters.formatCount(it) + " tokens") }
+        }
+        if (claude != null) {
+            claude.totalInputTokens?.let { KeyValue("Input tokens", Formatters.formatCount(it)) }
+            claude.totalOutputTokens?.let { KeyValue("Output tokens", Formatters.formatCount(it)) }
+            claude.currentUsage?.let { usage ->
+                usage.cacheReadInputTokens?.let { KeyValue("Cache read", Formatters.formatCount(it)) }
+                usage.cacheCreationInputTokens?.let { KeyValue("Cache created", Formatters.formatCount(it)) }
+            }
         }
         if (exceeds200k) Text("Exceeds 200k tokens", color = MaterialTheme.colorScheme.error)
     }
 }
 
+/** Session cost: the common `cost_usd` (or the Claude hook's total), plus the hook's timing and line counts. */
 @Composable
-private fun CostCard(cost: ClaudeCost) {
+private fun CostCard(costUsd: Double?, claude: ClaudeCost?) {
     InfoCard("Cost") {
-        cost.totalCostUsd?.let { KeyValue("Total", Formatters.formatUsd(it)) }
-        cost.totalDurationMs?.let { KeyValue("Wall time", Formatters.formatDurationMs(it)) }
-        cost.totalApiDurationMs?.let { KeyValue("API time", Formatters.formatDurationMs(it)) }
-        val added: Long? = cost.totalLinesAdded
-        val removed: Long? = cost.totalLinesRemoved
-        if (added != null || removed != null) {
-            KeyValue("Lines", "+${Formatters.formatCount(added ?: 0L)} / -${Formatters.formatCount(removed ?: 0L)}")
+        (costUsd ?: claude?.totalCostUsd)?.let { KeyValue("Total", Formatters.formatUsd(it)) }
+        if (claude != null) {
+            claude.totalDurationMs?.let { KeyValue("Wall time", Formatters.formatDurationMs(it)) }
+            claude.totalApiDurationMs?.let { KeyValue("API time", Formatters.formatDurationMs(it)) }
+            val added: Long? = claude.totalLinesAdded
+            val removed: Long? = claude.totalLinesRemoved
+            if (added != null || removed != null) {
+                KeyValue("Lines", "+${Formatters.formatCount(added ?: 0L)} / -${Formatters.formatCount(removed ?: 0L)}")
+            }
         }
+    }
+}
+
+/** Claude Code settings the generic card has no slot for; omitted when none are set. */
+@Composable
+private fun ClaudeDetailsCard(status: ClaudeStatus) {
+    val effort: String? = status.effort?.level
+    val thinking: Boolean = status.thinking?.enabled == true
+    val fast: Boolean = status.fastMode == true
+    val agent: String? = status.agent?.name
+    val vim: String? = status.vim?.mode
+    if (effort == null && !thinking && !fast && agent == null && vim == null) return
+    InfoCard("Claude Code") {
+        if (effort != null || thinking || fast) {
+            Row(horizontalArrangement = Arrangement.spacedBy(CHIP_SPACING), verticalAlignment = Alignment.CenterVertically) {
+                effort?.let { AssistChip(onClick = {}, label = { Text("effort: $it") }) }
+                if (thinking) AssistChip(onClick = {}, label = { Text("thinking") })
+                if (fast) AssistChip(onClick = {}, label = { Text("fast") })
+            }
+        }
+        agent?.let { KeyValue("Agent", it) }
+        vim?.let { KeyValue("Vim mode", it) }
+    }
+}
+
+/** Project, repo and worktree from the Claude hook; the cwd itself is in the generic card. */
+@Composable
+private fun ClaudeDirectoryCard(workspace: ClaudeWorkspace?, worktree: ClaudeWorktree?) {
+    val projectDir: String? = workspace?.projectDir
+    val repoName: String? = workspace?.repo?.let { repo -> listOfNotNull(repo.owner, repo.name).joinToString("/").ifEmpty { null } }
+    if (projectDir == null && repoName == null && worktree == null) return
+    InfoCard("Directory") {
+        projectDir?.let { KeyValue("Project", it) }
+        repoName?.let { KeyValue("Repo", it) }
+        worktree?.name?.let { KeyValue("Worktree", it) }
+        worktree?.branch?.let { KeyValue("Branch", it) }
     }
 }
 
@@ -221,12 +303,16 @@ private fun RawJsonCard(raw: kotlinx.serialization.json.JsonElement) {
     }
 }
 
-/** "updated N ago" that re-renders every second. */
+/** "updated N ago" and/or "started N ago", re-rendered every second. */
 @Composable
-private fun UpdatedAgo(updatedAtEpochSeconds: Long) {
+private fun Timestamps(updatedAtEpochSeconds: Long?, startedAtEpochSeconds: Long?) {
     val now: Long by tickingNow()
+    val parts: List<String> = listOfNotNull(
+        updatedAtEpochSeconds?.let { "updated " + Formatters.formatTimeAgo(it, now) },
+        startedAtEpochSeconds?.let { "started " + Formatters.formatTimeAgo(it, now) },
+    )
     Text(
-        "updated " + Formatters.formatTimeAgo(updatedAtEpochSeconds, now),
+        parts.joinToString(", "),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )

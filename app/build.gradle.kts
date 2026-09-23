@@ -34,6 +34,10 @@ android {
     packaging {
         resources.excludes += setOf("META-INF/INDEX.LIST", "META-INF/DEPENDENCIES", "META-INF/versions/9/OSGI-INF/MANIFEST.MF")
     }
+
+    // The remote helper scripts (salchang-probe, salchang-statusline) ship as assets straight
+    // from remote/ so there is a single copy to maintain; see dev.estaab.salchang.session.AgentProber.
+    sourceSets["main"].assets.srcDirs(rootProject.file("remote"))
 }
 
 // The Android slf4j binding calls android.util.Log, which is a stub in local JVM unit tests;

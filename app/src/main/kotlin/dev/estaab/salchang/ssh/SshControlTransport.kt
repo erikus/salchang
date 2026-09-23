@@ -36,6 +36,51 @@ private const val CLOSE_THREAD_NAME: String = "salchang-ssh-close"
 class RemoteCommandFailedException(val command: String, val exitStatus: Int?, val stderr: String) :
     IOException("`$command` exited with status $exitStatus: ${stderr.trim()}")
 
+/**
+ * A script running on an extra exec channel of an [SshControlTransport]'s SSH connection, started
+ * by [SshControlTransport.startScript] as `sh -s -- <args>` with the script body fed on stdin
+ * (stdin is already closed when the handle is returned). The caller must keep draining [input]
+ * and [errorStream]; [close] tears down the channel, which the remote sees as SIGPIPE on its next
+ * write. Closing the owning transport closes this channel too.
+ */
+class RemoteScript internal constructor(
+    private val session: Session,
+    private val command: Session.Command,
+    /** The exec command line, for logs. */
+    val commandLine: String,
+) : AutoCloseable {
+
+    /** stdout of the remote script. */
+    val input: InputStream = command.inputStream
+
+    /** stderr of the remote script. */
+    val errorStream: InputStream = command.errorStream
+
+    /** Exit status once the remote command has finished, null while it runs (or if the channel died first). */
+    val exitStatus: Int? get() = command.exitStatus
+
+    val isOpen: Boolean get() = command.isOpen
+
+    private val closed = AtomicBoolean(false)
+
+    /**
+     * Waits up to [timeoutMs] for the remote command to finish so that [exitStatus] is populated.
+     * Returns false on timeout.
+     */
+    fun join(timeoutMs: Long): Boolean = try {
+        command.join(timeoutMs, TimeUnit.MILLISECONDS)
+        true
+    } catch (e: IOException) {
+        false
+    }
+
+    /** Idempotent and asynchronous, for the same reason as [SshControlTransport.close]. */
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        SshControlTransport.closeOnDaemonThread(command, session)
+    }
+}
+
 /** One line of `tmux list-sessions` as parsed by [SshControlTransport.parseListSessions]. */
 data class RemoteTmuxSession(
     /** Session group name, null for an ungrouped session. */
@@ -111,13 +156,28 @@ class SshControlTransport private constructor(
      */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
-        val closer = Thread({
-            closeQuietly(command)
-            closeQuietly(session)
-            closeQuietly(client)
-        }, CLOSE_THREAD_NAME)
-        closer.isDaemon = true
-        closer.start()
+        closeOnDaemonThread(command, session, client)
+    }
+
+    /**
+     * Opens a second exec channel on this connection running `sh -s -- <args>`, writes [script]
+     * to its stdin and closes stdin, so the remote shell runs the script without anything being
+     * installed on the host. Runs on [Dispatchers.IO]; the returned handle is live. Throws
+     * `IOException` (including sshj's `ConnectionException`) if the transport is closed or the
+     * channel cannot be opened.
+     */
+    suspend fun startScript(script: ByteArray, args: List<String>): RemoteScript = withContext(Dispatchers.IO) {
+        if (closed.get() || !client.isConnected) throw IOException("SSH connection is closed")
+        val commandLine: String = buildScriptCommand(args)
+        val scriptSession: Session = client.startSession()
+        try {
+            val scriptCommand: Session.Command = scriptSession.exec(commandLine)
+            scriptCommand.outputStream.use { stdin: OutputStream -> stdin.write(script) }
+            RemoteScript(scriptSession, scriptCommand, commandLine)
+        } catch (e: Throwable) {
+            closeQuietly(scriptSession)
+            throw e
+        }
     }
 
     companion object {
@@ -149,6 +209,11 @@ class SshControlTransport private constructor(
 
         /** How long [runOnce] waits for the remote command to exit after stdout hits EOF. */
         const val RUN_ONCE_EXIT_WAIT_MS: Long = 10_000
+
+        /** `sh -s -- <args>`: POSIX shell reading the script from stdin, arguments after `--`. */
+        private const val SCRIPT_SHELL: String = "sh"
+        private const val SCRIPT_STDIN_FLAG: String = "-s"
+        private const val SCRIPT_END_OF_OPTIONS: String = "--"
 
         private const val TMUX_CONTROL_FLAG: String = "-C"
         private const val TMUX_SOCKET_NAME_FLAG: String = "-L"
@@ -264,18 +329,33 @@ class SshControlTransport private constructor(
             return args.joinToString(" ") { shellQuote(it) }
         }
 
+        /**
+         * `sh -s -- <args>` for [startScript], every argument single-quoted for the remote
+         * POSIX shell. Pure.
+         */
+        fun buildScriptCommand(args: List<String>): String =
+            (listOf(SCRIPT_SHELL, SCRIPT_STDIN_FLAG, SCRIPT_END_OF_OPTIONS) + args).joinToString(" ") { shellQuote(it) }
+
+        /**
+         * The tmux socket selection of [profile] as command-line arguments: `-S <path>` when a
+         * socket path is set (it wins), else `-L <name>` when a socket name is set, else nothing.
+         * Shared by every tmux invocation and by scripts that take the same flags
+         * (`remote/salchang-probe`). Pure.
+         */
+        fun tmuxSocketArgs(profile: HostProfile): List<String> {
+            val socketPath: String? = profile.tmuxSocketPath
+            val socketName: String? = profile.tmuxSocketName
+            return when {
+                !socketPath.isNullOrEmpty() -> listOf(TMUX_SOCKET_PATH_FLAG, socketPath)
+                !socketName.isNullOrEmpty() -> listOf(TMUX_SOCKET_NAME_FLAG, socketName)
+                else -> emptyList()
+            }
+        }
+
         /** `<tmuxBinary>` plus the socket flag shared by every tmux invocation for [profile]. */
         private fun tmuxBaseArgs(profile: HostProfile): MutableList<String> {
             val args: MutableList<String> = mutableListOf(profile.tmuxBinary)
-            val socketPath: String? = profile.tmuxSocketPath
-            val socketName: String? = profile.tmuxSocketName
-            if (!socketPath.isNullOrEmpty()) {
-                args += TMUX_SOCKET_PATH_FLAG
-                args += socketPath
-            } else if (!socketName.isNullOrEmpty()) {
-                args += TMUX_SOCKET_NAME_FLAG
-                args += socketName
-            }
+            args += tmuxSocketArgs(profile)
             return args
         }
 
@@ -412,6 +492,17 @@ class SshControlTransport private constructor(
 
         private fun authenticateBlocking(client: SSHClient, username: String, keyProvider: KeyProvider?) {
             if (keyProvider == null) client.auth(username, AuthNone()) else client.authPublickey(username, keyProvider)
+        }
+
+        /**
+         * Closes [closeables] in order on a short-lived daemon thread: sshj writes the
+         * channel-close / disconnect packets on the calling thread, which would be a
+         * `NetworkOnMainThreadException` from the UI. Errors are swallowed.
+         */
+        internal fun closeOnDaemonThread(vararg closeables: AutoCloseable) {
+            val closer = Thread({ closeables.forEach { closeQuietly(it) } }, CLOSE_THREAD_NAME)
+            closer.isDaemon = true
+            closer.start()
         }
 
         private fun closeQuietly(closeable: AutoCloseable?) {

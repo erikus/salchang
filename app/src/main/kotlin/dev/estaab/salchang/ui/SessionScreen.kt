@@ -142,6 +142,7 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
     val prompt: SessionPrompt? by controller.prompt.collectAsState()
     val lastError: String? by controller.lastError.collectAsState()
     val prefixArmed: Boolean by controller.prefixArmed.collectAsState()
+    val probeError: String? by controller.probeError.collectAsState()
     val snackbar: SnackbarHostState = remember { SnackbarHostState() }
     var subTab: Int by rememberSaveable { mutableIntStateOf(SUB_TAB_TERMINAL) }
     var windowDialog: WindowDialog? by remember { mutableStateOf(null) }
@@ -194,7 +195,7 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
             if (activeWindow != null) {
                 when (subTab) {
                     SUB_TAB_TERMINAL -> TerminalTab(controller, activeWindow, Modifier.weight(1f))
-                    else -> InfoTab(activeWindow, controller::parseMeta, Modifier.weight(1f))
+                    else -> InfoTab(activeWindow, controller::parseMeta, probeError, Modifier.weight(1f))
                 }
             } else {
                 Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -341,7 +342,7 @@ private fun WindowTabs(
     val selectedIndex: Int = windows.indexOfFirst { it.id == activeWindowId }.coerceAtLeast(0)
     PrimaryScrollableTabRow(selectedTabIndex = selectedIndex, edgePadding = 0.dp) {
         windows.forEach { window ->
-            val hasClaude: Boolean = window.meta.values.any { parseMeta(it) is WindowMeta.ClaudeCode }
+            val hasAgent: Boolean = window.meta.values.any { parseMeta(it) is WindowMeta.Payload }
             val selected: Boolean = window.id == activeWindowId
             Row(
                 Modifier
@@ -355,7 +356,7 @@ private fun WindowTabs(
                     color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                 )
-                if (hasClaude) {
+                if (hasAgent) {
                     Box(
                         Modifier
                             .padding(start = META_DOT_SPACING)
