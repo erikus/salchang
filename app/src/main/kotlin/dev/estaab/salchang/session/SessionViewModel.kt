@@ -43,11 +43,18 @@ class SessionViewModel(application: Application, val hostId: String) : AndroidVi
                 keyStore = app.keyStore,
                 knownHostsFactory = { prompt -> app.knownHosts(prompt) },
                 copyToClipboard = { text -> copyToClipboard(text) },
+                loadProbeScript = { loadAsset(PROBE_ASSET_NAME) },
                 scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
             )
             _controller.value = controller
             controller.connect()
         }
+    }
+
+    /** Reads an app asset fully; blocking, so call it off the main thread. */
+    private fun loadAsset(name: String): ByteArray {
+        val app: Application = getApplication()
+        return app.assets.open(name).use { it.readBytes() }
     }
 
     private fun copyToClipboard(text: String) {

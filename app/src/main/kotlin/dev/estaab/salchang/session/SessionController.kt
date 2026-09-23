@@ -74,6 +74,8 @@ class SessionController(
     private val keyStore: KeyStore,
     knownHostsFactory: (HostKeyPrompt) -> KnownHosts,
     private val copyToClipboard: (String) -> Unit,
+    /** Reads the `remote/salchang-probe` asset; invoked on an IO thread once per connect. */
+    private val loadProbeScript: () -> ByteArray,
     private val scope: CoroutineScope,
 ) {
     private val knownHosts: KnownHosts = knownHostsFactory(HostKeyPrompt { hostname, keyType, fingerprint ->
@@ -110,8 +112,16 @@ class SessionController(
     /** True between the prefix key and the key it applies to, for a UI indicator. */
     val prefixArmed: StateFlow<Boolean> = _prefixArmed.asStateFlow()
 
+    private val _probeError: MutableStateFlow<String?> = MutableStateFlow(null)
+    /**
+     * The agent probe's stderr if it exited because `tmux` or `jq` is missing on the host
+     * (see [AgentProber.dependencyError]); shown in the Info tab's no-metadata hint. Null otherwise.
+     */
+    val probeError: StateFlow<String?> = _probeError.asStateFlow()
+
     private var client: TmuxControlClient? = null
     private var transport: SshControlTransport? = null
+    private var prober: AgentProber? = null
     private var connectJob: Job? = null
     private var resizeJob: Job? = null
     private val clientJobs: MutableList<Job> = ArrayList()
@@ -216,6 +226,21 @@ class SessionController(
         // The view may have reported its grid while we were connecting; tmux still has the size start() sent.
         if (clientCols != startCols || clientRows != startRows) scheduleClientSize(client)
         loadKeyBindings(client)
+        if (this.client === client) startProber(transport)
+    }
+
+    /**
+     * Starts `remote/salchang-probe` on a second channel of [transport]; it publishes agent
+     * metadata through the pane option the control client already watches. Its dependency
+     * error (if any) is mirrored into [probeError]. Stopped by [teardown].
+     */
+    private fun startProber(transport: SshControlTransport) {
+        val prober = AgentProber(transport, loadProbeScript, AgentProber.probeArgs(profile), scope)
+        this.prober = prober
+        clientJobs += scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            prober.dependencyError.collect { _probeError.value = it }
+        }
+        prober.start()
     }
 
     /**
@@ -277,6 +302,9 @@ class SessionController(
         bootstraps.clear()
         _keyRouter.value = null
         _prefixArmed.value = false
+        prober?.stop()
+        prober = null
+        _probeError.value = null
         client?.close()
         client = null
         transport?.close()

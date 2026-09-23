@@ -40,6 +40,23 @@ class SshControlTransportTest {
     }
 
     @Test
+    fun tmuxSocketArgsMirrorTheControlCommand() {
+        assertEquals(emptyList<String>(), SshControlTransport.tmuxSocketArgs(base))
+        assertEquals(listOf("-L", "dev"), SshControlTransport.tmuxSocketArgs(base.copy(tmuxSocketName = "dev")))
+        assertEquals(listOf("-S", "/tmp/s"), SshControlTransport.tmuxSocketArgs(base.copy(tmuxSocketName = "dev", tmuxSocketPath = "/tmp/s")))
+        assertEquals(emptyList<String>(), SshControlTransport.tmuxSocketArgs(base.copy(tmuxSocketName = "", tmuxSocketPath = "")))
+    }
+
+    @Test
+    fun scriptCommandFeedsStdinAndQuotesArgs() {
+        assertEquals("'sh' '-s' '--'", SshControlTransport.buildScriptCommand(emptyList()))
+        assertEquals(
+            "'sh' '-s' '--' '-S' '/tmp/tmux sock' '--interval' '3'",
+            SshControlTransport.buildScriptCommand(listOf("-S", "/tmp/tmux sock", "--interval", "3")),
+        )
+    }
+
+    @Test
     fun shellQuoteEscapesSingleQuotes() {
         assertEquals("'it'\\''s'", SshControlTransport.shellQuote("it's"))
         assertEquals("''", SshControlTransport.shellQuote(""))
