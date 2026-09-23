@@ -4,6 +4,8 @@ import android.app.Application
 import android.content.ClipData
 import android.content.ClipboardManager
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import dev.estaab.salchang.SalchangApp
 import dev.estaab.salchang.data.HostProfile
@@ -11,8 +13,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 private const val CLIPBOARD_LABEL: String = "salchang"
@@ -30,6 +35,17 @@ class SessionViewModel(application: Application, val hostId: String) : AndroidVi
     private val _missingProfile: MutableStateFlow<Boolean> = MutableStateFlow(false)
     val missingProfile: StateFlow<Boolean> = _missingProfile.asStateFlow()
 
+    /**
+     * Whether the app is visible, for the controller's background handling. Process-wide rather
+     * than per activity so a session kept alive from the host list behaves the same;
+     * `ProcessLifecycleOwner` also debounces the stop that a configuration change causes.
+     */
+    private val foreground: StateFlow<Boolean> = ProcessLifecycleOwner.get().lifecycle.let { lifecycle ->
+        lifecycle.currentStateFlow
+            .map { it.isAtLeast(Lifecycle.State.STARTED) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
+    }
+
     init {
         viewModelScope.launch {
             val app: SalchangApp = getApplication()
@@ -44,6 +60,7 @@ class SessionViewModel(application: Application, val hostId: String) : AndroidVi
                 knownHostsFactory = { prompt -> app.knownHosts(prompt) },
                 copyToClipboard = { text -> copyToClipboard(text) },
                 scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
+                foreground = foreground,
             )
             _controller.value = controller
             controller.connect()

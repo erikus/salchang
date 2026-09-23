@@ -267,7 +267,11 @@ private fun ConnectionBanner(connection: ConnectionState) {
         is ConnectionState.Connecting -> "Connecting..." to false
         is ConnectionState.NeedsPassphrase -> "Waiting for passphrase" to false
         is ConnectionState.Connected -> null to false
-        is ConnectionState.Disconnected -> (c.reason?.let { "Disconnected: $it" } ?: "Disconnected") to false
+        is ConnectionState.Disconnected -> when {
+            c.lost -> "Connection lost: ${c.reason}" to true
+            c.reason != null -> "Disconnected: ${c.reason}" to false
+            else -> "Disconnected" to false
+        }
         is ConnectionState.Failed -> "Connection failed: ${c.error.message ?: c.error.javaClass.simpleName}" to true
     }
     if (text == null) return
