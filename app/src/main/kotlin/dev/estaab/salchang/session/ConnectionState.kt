@@ -16,8 +16,12 @@ sealed interface ConnectionState {
     /** Attached to tmux; terminals are live. */
     data object Connected : ConnectionState
 
-    /** Not connected; [reason] is null before the first connect attempt. */
-    data class Disconnected(val reason: String?) : ConnectionState
+    /**
+     * Not connected; [reason] is null before the first connect attempt. [lost] is true when the
+     * SSH transport failed underneath a live session (as opposed to the user disconnecting or
+     * tmux ending the client), which is what auto-reconnect acts on.
+     */
+    data class Disconnected(val reason: String?, val lost: Boolean) : ConnectionState
 
     /** The last connect attempt threw; the message is shown in the banner. */
     data class Failed(val error: Throwable) : ConnectionState

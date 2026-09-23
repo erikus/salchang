@@ -1,5 +1,6 @@
 package dev.estaab.salchang.session
 
+import android.os.SystemClock
 import android.util.Log
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSink
@@ -53,6 +54,13 @@ private const val DISCONNECT_TIMEOUT_MS: Long = 3_000L
 /** Parsed meta values kept per distinct raw option string. */
 private const val META_CACHE_SIZE: Int = 64
 
+/**
+ * A lost connection is re-established automatically only if it had been up at least this
+ * long, so a link that dies right after every attach cannot reconnect in a loop; after that
+ * the banner's Reconnect button is the way back.
+ */
+private const val AUTO_RECONNECT_MIN_UPTIME_MS: Long = 10_000L
+
 /** Bytes of tmux stderr read (non-blocking) when the control stream dies, to explain why. */
 private const val STDERR_SNIPPET_BYTES: Int = 2_048
 
@@ -68,6 +76,12 @@ private const val LIST_ROOT_KEYS_COMMAND: String = "list-keys -T root"
  * Threading: [scope] must be `Dispatchers.Main.immediate`. Everything that touches an emulator
  * runs in it; the tmux reader runs on IO inside the same scope and hands events back via
  * `TmuxControlClient.events`. Public methods are main-thread only unless noted.
+ *
+ * Background handling: Android cuts a backgrounded app off the network while its sockets stay
+ * open, so while [foreground] is false the transport's keepalive is stopped instead of letting
+ * it declare the connection dead. On return a probe decides whether the socket survived; if
+ * not (or if the connection was lost meanwhile) the session is re-attached automatically and
+ * the window that was current before is selected again.
  */
 class SessionController(
     val profile: HostProfile,
@@ -75,12 +89,15 @@ class SessionController(
     knownHostsFactory: (HostKeyPrompt) -> KnownHosts,
     private val copyToClipboard: (String) -> Unit,
     private val scope: CoroutineScope,
+    /** True while the app has a visible activity (`ProcessLifecycleOwner` started or above). */
+    private val foreground: StateFlow<Boolean>,
 ) {
     private val knownHosts: KnownHosts = knownHostsFactory(HostKeyPrompt { hostname, keyType, fingerprint ->
         askHostKey(hostname, keyType, fingerprint)
     })
 
-    private val _connectionState: MutableStateFlow<ConnectionState> = MutableStateFlow(ConnectionState.Disconnected(null))
+    private val _connectionState: MutableStateFlow<ConnectionState> =
+        MutableStateFlow(ConnectionState.Disconnected(reason = null, lost = false))
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
     private val _tmuxState: MutableStateFlow<TmuxState> = MutableStateFlow(TmuxState.EMPTY)
@@ -119,6 +136,9 @@ class SessionController(
     private var clientCols: Int = TerminalSizing.DEFAULT_CLIENT_COLS
     private var clientRows: Int = TerminalSizing.DEFAULT_CLIENT_ROWS
 
+    /** `SystemClock.elapsedRealtime()` when the current connection reached [ConnectionState.Connected]. */
+    private var connectedAtMs: Long = 0L
+
     /**
      * Pane bootstraps awaiting tracked replies, keyed by both of their tokens (see [bootstrap]).
      * Main thread only.
@@ -130,6 +150,11 @@ class SessionController(
         object : LinkedHashMap<String, WindowMeta>(META_CACHE_SIZE, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, WindowMeta>?): Boolean = size > META_CACHE_SIZE
         }
+
+    init {
+        // Main.immediate: runs the current value synchronously, before the constructor returns.
+        scope.launch { foreground.collect { onForegroundChanged(it) } }
+    }
 
     // ---- connection lifecycle --------------------------------------------------------------
 
@@ -169,7 +194,7 @@ class SessionController(
                 _connectionState.value = ConnectionState.NeedsPassphrase
                 passphrase = askPassphrase(key.name)
                 if (passphrase == null) {
-                    _connectionState.value = ConnectionState.Disconnected("Passphrase required")
+                    _connectionState.value = ConnectionState.Disconnected("Passphrase required", lost = false)
                     return
                 }
                 _connectionState.value = ConnectionState.Connecting()
@@ -186,6 +211,10 @@ class SessionController(
             passphrase?.fill('\u0000')
         }
         this.transport = transport
+        if (!foreground.value) transport.stopKeepAlive()
+        // The state flow keeps the last session after a disconnect; the new client's collector
+        // below resets it, so remember the current window now to restore it after the attach.
+        val previousWindowId: String? = _tmuxState.value.activeWindowId
         val client = TmuxControlClient(transport, scope)
         this.client = client
         // UNDISPATCHED so both collectors are subscribed before start() sends anything.
@@ -212,10 +241,45 @@ class SessionController(
             return
         }
         if (this.client !== client) return
+        connectedAtMs = SystemClock.elapsedRealtime()
         _connectionState.value = ConnectionState.Connected
         // The view may have reported its grid while we were connecting; tmux still has the size start() sent.
         if (clientCols != startCols || clientRows != startRows) scheduleClientSize(client)
+        if (previousWindowId != null) restoreWindow(client, previousWindowId)
+        if (this.client !== client) return
         loadKeyBindings(client)
+    }
+
+    /**
+     * A session joining a group starts on the group's lowest-index window, not on the one the
+     * previous session was showing; select [windowId] again if it still exists. Window ids are
+     * server-wide, so they stay valid across re-attaches.
+     */
+    private suspend fun restoreWindow(client: TmuxControlClient, windowId: String) {
+        val state: TmuxState = client.state.value
+        if (state.activeWindowId == windowId || state.window(windowId) == null) return
+        try {
+            client.selectWindow(windowId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "restoring window $windowId after reconnect failed", e)
+        }
+    }
+
+    private fun onForegroundChanged(inForeground: Boolean) {
+        val transport: SshControlTransport? = this.transport
+        if (!inForeground) {
+            transport?.stopKeepAlive()
+            return
+        }
+        if (transport != null) {
+            // Probe now: if the socket died while we were away, this fails it and onClientDead reconnects.
+            transport.startKeepAlive(probeFirst = true)
+            return
+        }
+        val state: ConnectionState = _connectionState.value
+        if (state is ConnectionState.Disconnected && state.lost) connect()
     }
 
     /**
@@ -253,7 +317,7 @@ class SessionController(
             }
         }
         teardown()
-        _connectionState.value = ConnectionState.Disconnected(reason)
+        _connectionState.value = ConnectionState.Disconnected(reason, lost = false)
     }
 
     /**
@@ -329,23 +393,36 @@ class SessionController(
         when (event) {
             is TmuxEvent.PaneOutput -> _terminals.value[event.paneId]?.onOutput(event.bytes)
             is TmuxEvent.CommandReply -> onCommandReply(event)
-            is TmuxEvent.Exit -> onClientDead(client, event.reason ?: "tmux exited")
+            is TmuxEvent.Exit -> onClientDead(client, event.reason ?: "tmux exited", lost = false)
             is TmuxEvent.TransportError -> {
                 if (event.cause is TmuxCommandException) {
                     _lastError.value = event.cause.message
                 } else {
-                    onClientDead(client, describe(event.cause))
+                    onClientDead(client, describe(event.cause), lost = true)
                 }
             }
             is TmuxEvent.WindowsChanged, is TmuxEvent.MetaChanged -> Unit
         }
     }
 
-    private suspend fun onClientDead(client: TmuxControlClient, reason: String) {
+    /**
+     * The control stream ended. [lost] is true when the transport failed (as opposed to tmux
+     * ending the client with `%exit`); a keepalive verdict recorded on the transport takes
+     * precedence over the generic stream error. A lost connection that was up long enough is
+     * re-attached right away if the app is visible, otherwise when it next becomes visible.
+     */
+    private suspend fun onClientDead(client: TmuxControlClient, reason: String, lost: Boolean) {
         if (this.client !== client) return
+        val transport: SshControlTransport? = this.transport
+        val keepAliveVerdict: String? = transport?.failureReason
         val stderr: String = transport?.let { readStderr(it) } ?: ""
+        val wasConnected: Boolean = _connectionState.value == ConnectionState.Connected
         teardown()
-        _connectionState.value = ConnectionState.Disconnected(if (stderr.isEmpty()) reason else "$reason: $stderr")
+        val fullReason: String = keepAliveVerdict ?: if (stderr.isEmpty()) reason else "$reason: $stderr"
+        val connectionLost: Boolean = lost || keepAliveVerdict != null
+        _connectionState.value = ConnectionState.Disconnected(fullReason, lost = connectionLost)
+        val uptimeMs: Long = SystemClock.elapsedRealtime() - connectedAtMs
+        if (connectionLost && wasConnected && uptimeMs >= AUTO_RECONNECT_MIN_UPTIME_MS && foreground.value) connect()
     }
 
     private fun onTmuxState(state: TmuxState) {

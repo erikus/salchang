@@ -4,20 +4,23 @@ import dev.estaab.salchang.data.AuthMethod
 import dev.estaab.salchang.data.HostProfile
 import dev.estaab.salchang.data.KeyStore
 import dev.estaab.salchang.tmuxctl.ControlTransport
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import net.schmizz.keepalive.KeepAlive
-import net.schmizz.keepalive.KeepAliveProvider
-import net.schmizz.keepalive.KeepAliveRunner
+import net.schmizz.concurrent.Promise
 import net.schmizz.sshj.DefaultConfig
 import net.schmizz.sshj.SSHClient
+import net.schmizz.sshj.common.SSHPacket
+import net.schmizz.sshj.connection.ConnectionException
 import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.transport.TransportException
 import net.schmizz.sshj.userauth.keyprovider.KeyProvider
@@ -31,6 +34,13 @@ import kotlin.coroutines.coroutineContext
 
 /** Name of the short-lived thread [SshControlTransport.close] runs the sshj shutdown on. */
 private const val CLOSE_THREAD_NAME: String = "salchang-ssh-close"
+
+/**
+ * Global request used as the liveness probe, as OpenSSH's own client sends. Servers answer
+ * it with `REQUEST_FAILURE` (it is deliberately unknown), and any answer proves the peer
+ * and the path to it are alive; only silence counts as a miss.
+ */
+private const val KEEPALIVE_REQUEST_NAME: String = "keepalive@openssh.com"
 
 /** A one-off remote command exited non-zero. */
 class RemoteCommandFailedException(val command: String, val exitStatus: Int?, val stderr: String) :
@@ -96,6 +106,20 @@ class SshControlTransport private constructor(
     val isOpen: Boolean get() = command.isOpen && client.isConnected
 
     /**
+     * Why [fail] closed this transport (a keepalive verdict), null while it is open or after a
+     * plain [close]. The session controller reads it when the control stream ends, to tell a
+     * lost connection from tmux exiting.
+     */
+    @Volatile
+    var failureReason: String? = null
+        private set
+
+    private val keepAliveScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Guarded by `synchronized(this)`. */
+    private var keepAliveJob: Job? = null
+
+    /**
      * The SSH auth banner (`SSH_MSG_USERAUTH_BANNER`) the server sent during authentication,
      * null if none. Tailscale SSH in check mode puts the approval URL here.
      */
@@ -111,6 +135,7 @@ class SshControlTransport private constructor(
      */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        keepAliveScope.cancel()
         val closer = Thread({
             closeQuietly(command)
             closeQuietly(session)
@@ -119,6 +144,91 @@ class SshControlTransport private constructor(
         closer.isDaemon = true
         closer.start()
     }
+
+    /**
+     * Closes the transport because of [reason], which [failureReason] then reports. The reader
+     * of [input] sees the stream end, like for any other lost connection. No-op once closed.
+     */
+    fun fail(reason: String) {
+        if (closed.get()) return
+        failureReason = reason
+        close()
+    }
+
+    // ---- keepalive -------------------------------------------------------------------------
+    //
+    // sshj's own KeepAliveRunner cannot be paused (an interval of 0 makes its thread spin), so
+    // the transport runs its own: Android cuts a backgrounded app off the network while the
+    // socket stays open, and a keepalive that keeps counting misses there declares a healthy
+    // connection dead within a minute. The controller stops it in the background and restarts
+    // it with a probe when the app comes back.
+
+    /**
+     * Starts (or restarts) sending [KEEPALIVE_REQUEST_NAME] every [KEEPALIVE_INTERVAL_MS], and
+     * [fail]s the transport once [KEEPALIVE_MAX_MISSED] requests in a row are unanswered.
+     * With [probeFirst] one request is sent immediately and must be answered within
+     * [PROBE_TIMEOUT_MS], for returning to the foreground: the socket may look open while
+     * the server or the NAT dropped it long ago. No-op once closed.
+     */
+    @Synchronized
+    fun startKeepAlive(probeFirst: Boolean) {
+        keepAliveJob?.cancel()
+        keepAliveJob = null
+        if (closed.get()) return
+        keepAliveJob = keepAliveScope.launch { keepAliveLoop(probeFirst) }
+    }
+
+    /** Stops sending keepalives; an outstanding one is forgotten. See [startKeepAlive]. */
+    @Synchronized
+    fun stopKeepAlive() {
+        keepAliveJob?.cancel()
+        keepAliveJob = null
+    }
+
+    private suspend fun keepAliveLoop(probeFirst: Boolean) {
+        if (probeFirst) {
+            val answered: Boolean = try {
+                awaitReply(sendKeepAlive(), PROBE_TIMEOUT_MS)
+            } catch (e: IOException) {
+                false
+            }
+            if (!answered) {
+                fail("No reply to the keepalive probe within ${PROBE_TIMEOUT_MS / MS_PER_SECOND} seconds")
+                return
+            }
+        }
+        val unanswered: ArrayDeque<Promise<SSHPacket, ConnectionException>> = ArrayDeque()
+        while (true) {
+            delay(KEEPALIVE_INTERVAL_MS)
+            unanswered.removeAll { it.isDelivered }
+            if (unanswered.size >= KEEPALIVE_MAX_MISSED) {
+                fail("No keepalive reply for ${KEEPALIVE_MAX_MISSED * KEEPALIVE_INTERVAL_MS / MS_PER_SECOND} seconds")
+                return
+            }
+            try {
+                unanswered += sendKeepAlive()
+            } catch (e: IOException) {
+                fail("Sending a keepalive failed: ${e.message}")
+                return
+            }
+        }
+    }
+
+    /** Blocking write on the calling (IO) thread; throws `TransportException` if the transport is down. */
+    private fun sendKeepAlive(): Promise<SSHPacket, ConnectionException> =
+        client.connection.sendGlobalRequest(KEEPALIVE_REQUEST_NAME, true, ByteArray(0))
+
+    /**
+     * Blocks up to [timeoutMs]. True if the server answered at all: `REQUEST_FAILURE` arrives
+     * as a delivered error and proves liveness just as well. A transport that died meanwhile
+     * also delivers an error; that case is reported by the reader of [input], not here.
+     */
+    private fun awaitReply(reply: Promise<SSHPacket, ConnectionException>, timeoutMs: Long): Boolean =
+        try {
+            reply.tryRetrieve(timeoutMs, TimeUnit.MILLISECONDS) != null
+        } catch (e: ConnectionException) {
+            true
+        }
 
     companion object {
         /** TCP connect timeout. */
@@ -141,11 +251,20 @@ class SshControlTransport private constructor(
          */
         const val AUTH_BANNER_POLL_MS: Long = 250
 
-        /** Interval between `keepalive@openssh.com` global requests. */
-        const val KEEPALIVE_SECONDS: Int = 15
+        private const val MS_PER_SECOND: Long = 1_000L
 
-        /** Unanswered keepalives before sshj declares the connection dead. */
+        /** Interval between keepalive requests while [startKeepAlive] is running. */
+        const val KEEPALIVE_INTERVAL_MS: Long = 15_000L
+
+        /** Unanswered keepalives in a row before the transport [fail]s (60 s with the interval above). */
         const val KEEPALIVE_MAX_MISSED: Int = 4
+
+        /**
+         * How long the foreground probe (see [startKeepAlive]) waits for its reply. Long enough
+         * for a phone re-joining Wi-Fi after unlock, short enough that a dead socket turns into
+         * a reconnect before the user starts typing into it.
+         */
+        const val PROBE_TIMEOUT_MS: Long = 8_000L
 
         /** How long [runOnce] waits for the remote command to exit after stdout hits EOF. */
         const val RUN_ONCE_EXIT_WAIT_MS: Long = 10_000
@@ -197,7 +316,7 @@ class SshControlTransport private constructor(
                 try {
                     val session: Session = client.startSession()
                     val command: Session.Command = session.exec(buildTmuxCommand(profile))
-                    SshControlTransport(client, session, command)
+                    SshControlTransport(client, session, command).also { it.startKeepAlive(probeFirst = false) }
                 } catch (e: Throwable) {
                     closeQuietly(client)
                     throw e
@@ -347,16 +466,11 @@ class SshControlTransport private constructor(
             }
 
             val verifier: TofuHostKeyVerifier = knownHosts.createVerifier()
-            val config = DefaultConfig()
-            config.keepAliveProvider = KeepAliveProvider.KEEP_ALIVE
-            val client = SSHClient(config)
+            // Default config: no sshj keepalive thread; the transport runs its own (see startKeepAlive).
+            val client = SSHClient(DefaultConfig())
             client.addHostKeyVerifier(verifier)
             client.connectTimeout = CONNECT_TIMEOUT_MS
             client.timeout = HANDSHAKE_TIMEOUT_MS
-            // Must be configured before connect(): sshj only starts the keepalive thread then.
-            val keepAlive: KeepAlive = client.connection.keepAlive
-            keepAlive.keepAliveInterval = KEEPALIVE_SECONDS
-            (keepAlive as? KeepAliveRunner)?.maxAliveCount = KEEPALIVE_MAX_MISSED
 
             try {
                 try {
