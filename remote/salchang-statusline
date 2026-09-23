@@ -1,13 +1,36 @@
 #!/bin/sh
-# salchang-statusline — Claude Code statusLine command.
+# salchang-statusline — optional Claude Code statusLine command.
+#
+# The salchang app discovers running agents on its own (see salchang-probe),
+# so this hook is not required. It adds what only Claude Code itself knows:
+# exact context window size, cost, rate limits, effort, PR and worktree.
 #
 # Reads the status JSON Claude Code passes on stdin, stores it on the current
-# tmux pane as the user option @salchang_meta (so the salchang Android app can
-# show it in the window's Info tab), then prints a short status line.
+# tmux pane as the user option @salchang_meta (schema v2, source "statusline";
+# the full status JSON is kept under "data"), then either prints a short
+# status line or hands the same JSON to your own status line script.
 #
-# Install:
-#   cp remote/salchang-statusline ~/.local/bin/ && chmod +x ~/.local/bin/salchang-statusline
-#   ~/.claude/settings.json:  "statusLine": {"type": "command", "command": "~/.local/bin/salchang-statusline"}
+# Install (standalone):
+#   install -m 0755 remote/salchang-statusline ~/.local/bin/salchang-statusline
+#   ~/.claude/settings.json:
+#     "statusLine": {"type": "command", "command": "~/.local/bin/salchang-statusline"}
+#
+# Install (keep your existing status line script):
+#   "statusLine": {"type": "command",
+#                  "command": "~/.local/bin/salchang-statusline --exec ~/.claude/statusline.sh"}
+#
+# Or paste this into your existing script instead (it reads stdin into
+# $input, as most do), no install needed:
+#
+#   if [ -n "${TMUX_PANE:-}" ] && command -v jq >/dev/null 2>&1; then
+#       tmux set-option -p -t "$TMUX_PANE" @salchang_meta "$(printf '%s' "$input" | jq -c '{
+#           kind: "claude-code", source: "statusline", updated_at: (now | floor),
+#           agent_name: "Claude Code", version, cwd: (.cwd // .workspace.current_dir),
+#           session_id, title: .session_name, model: .model.id, model_name: .model.display_name,
+#           context_used: (.context_window.current_usage | if . then ((.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)) else null end),
+#           context_window: .context_window.context_window_size, cost_usd: .cost.total_cost_usd,
+#           data: .} | with_entries(select(.value != null))')" 2>/dev/null
+#   fi
 #
 # Requires: tmux (>= 3.0 for pane options), jq.
 
@@ -15,17 +38,42 @@ set -eu
 
 META_OPTION="@salchang_meta"
 META_KIND="claude-code"
+META_SOURCE="statusline"
+
+EXEC_CMD=""
+if [ "${1:-}" = "--exec" ]; then
+    [ $# -ge 2 ] || { echo "salchang-statusline: --exec needs a command" >&2; exit 1; }
+    shift
+    EXEC_CMD="$*"
+fi
 
 input=$(cat)
 
 if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-    payload=$(printf '%s' "$input" | jq -c --arg kind "$META_KIND" '{kind: $kind, updated_at: (now | floor), data: .}') || payload=""
+    payload=$(printf '%s' "$input" | jq -c --arg kind "$META_KIND" --arg source "$META_SOURCE" '{
+        kind: $kind,
+        source: $source,
+        updated_at: (now | floor),
+        agent_name: "Claude Code",
+        version,
+        cwd: (.cwd // .workspace.current_dir),
+        session_id,
+        title: .session_name,
+        model: .model.id,
+        model_name: .model.display_name,
+        context_used: (.context_window.current_usage | if . then ((.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)) else null end),
+        context_window: .context_window.context_window_size,
+        cost_usd: .cost.total_cost_usd,
+        data: .
+    } | with_entries(select(.value != null))') || payload=""
     if [ -n "$payload" ]; then
         tmux set-option -p -t "$TMUX_PANE" "$META_OPTION" "$payload" >/dev/null 2>&1 || true
     fi
 fi
 
-if command -v jq >/dev/null 2>&1; then
+if [ -n "$EXEC_CMD" ]; then
+    printf '%s' "$input" | eval "exec $EXEC_CMD"
+elif command -v jq >/dev/null 2>&1; then
     printf '%s' "$input" | jq -r '"[\(.model.display_name // "?")] \(.workspace.current_dir // .cwd // "") \(.context_window.used_percentage // 0)% ctx $\(.cost.total_cost_usd // 0 | . * 100 | round / 100)"'
 else
     printf 'claude\n'

@@ -1,0 +1,462 @@
+#!/bin/sh
+# salchang-probe — find coding agents running in tmux panes and publish what
+# they are up to as the tmux pane option @salchang_meta.
+#
+# The salchang Android app streams this script to the host over SSH
+# (`sh -s -- ...`), so nothing has to be installed. It can also be run by
+# hand, e.g. `salchang-probe --once --dry-run` to see what it would publish.
+#
+# Usage:
+#   salchang-probe [-L socket-name | -S socket-path] [--interval SECS]
+#                  [--once] [--dry-run] [--verbose]
+#
+#   -L / -S       tmux socket, as for tmux itself (default: tmux's default)
+#   --interval N  seconds between probes in loop mode (default 3)
+#   --once        probe one time and exit
+#   --dry-run     print "<pane-id>\t<json>" instead of setting the option
+#   --verbose     log detector activity to stderr
+#
+# Requires: tmux (>= 3.0 for pane options), jq. Linux /proc is used when
+# present; otherwise ps/lsof.
+#
+# Exit status: 0 normal, 1 bad usage, 2 missing dependency.
+#
+# ---------------------------------------------------------------------------
+# Payload (schema v2). One JSON object per pane; every key but "kind" is
+# optional and null means unknown:
+#
+#   kind           harness id: claude-code | codex | pi | <your own>
+#   source         "probe" (this script) or "statusline" (the optional hook)
+#   updated_at     epoch seconds when the payload last changed
+#   agent_name     display name ("Claude Code", "Codex", "Pi")
+#   version        harness version
+#   cwd            agent's working directory
+#   session_id     harness session / thread id
+#   title          session name or title, if the harness keeps one
+#   status         "busy" | "idle" | a harness-specific word | absent
+#   started_at     epoch seconds
+#   model          model id
+#   model_name     display name, when known
+#   context_used   tokens in the context as of the last turn
+#   context_window window size in tokens, when known
+#   cost_usd       session cost, when the harness tracks it
+#   data           harness-specific extras (free-form object)
+#
+# ---------------------------------------------------------------------------
+# Detector contract (how to add a harness)
+#
+# A detector is a shell function named detect_<name>. It is called once per
+# pane with these globals set:
+#
+#   PANE_ID         tmux pane id, e.g. %12
+#   PANE_PID        pid of the pane's shell
+#   PANE_CMD        tmux's #{pane_current_command} (foreground process name)
+#   PANE_CWD        tmux's #{pane_current_path}
+#   PANE_PIDS       PANE_PID and all its descendants, space separated
+#   PANE_PIDS_JSON  the same as a JSON array
+#
+# It prints nothing if the pane is not running its harness, otherwise a
+# single-line JSON object with the keys above ("kind" required). "source" and
+# "updated_at" are added by the caller. Detectors run in a subshell, so they
+# cannot cache anything; a detector that needs per-probe state (an index over
+# its harness's state files, say) defines prepare_<name>, which is called once
+# per probe in the main shell before any pane is visited. Helpers available:
+#
+#   pane_proc NAME          pid of the first process in PANE_PIDS whose
+#                           command name is NAME, or nothing
+#   proc_open_files PID     one open file path per line
+#   proc_start_epoch PID    process start time, epoch seconds
+#   last_line_matching FILE PATTERN [N]
+#                           last of the final N lines (default 400) of FILE
+#                           that contains fixed string PATTERN
+#   log MSG                 stderr, only with --verbose
+#
+# Built-in detectors are listed in DETECTORS below. To add your own, drop a
+# file into ${XDG_CONFIG_HOME:-~/.config}/salchang/probe.d/ ending in .sh
+# that defines detect_<name> and runs
+#
+#     DETECTORS="$DETECTORS <name>"
+#
+# Detectors run in the listed order; the first one that prints wins.
+# ---------------------------------------------------------------------------
+
+META_OPTION="@salchang_meta"
+DEFAULT_INTERVAL=3
+TAIL_LINES=400
+# Claude Code does not record the window size on disk; these mirror its
+# published model limits.
+CLAUDE_CONTEXT_WINDOW=200000
+CLAUDE_CONTEXT_WINDOW_1M=1000000
+# A Pi session file may appear a few seconds after the process starts.
+PI_START_SLACK_SECS=30
+
+DETECTORS="claude_code codex pi"
+DROPIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/salchang/probe.d"
+
+TMUX_ARGS=""
+INTERVAL=$DEFAULT_INTERVAL
+ONCE=0
+DRY_RUN=0
+VERBOSE=0
+
+usage() {
+    sed -n '2,20p' "$0" 2>/dev/null >&2 || echo "usage: salchang-probe [-L name|-S path] [--interval N] [--once] [--dry-run] [--verbose]" >&2
+    exit 1
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -L) [ $# -ge 2 ] || usage; TMUX_ARGS="-L $2"; shift 2 ;;
+        -S) [ $# -ge 2 ] || usage; TMUX_ARGS="-S $2"; shift 2 ;;
+        --interval) [ $# -ge 2 ] || usage; INTERVAL=$2; shift 2 ;;
+        --once) ONCE=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --verbose) VERBOSE=1; shift ;;
+        -h|--help) usage ;;
+        *) echo "salchang-probe: unknown argument: $1" >&2; usage ;;
+    esac
+done
+
+for dep in tmux jq; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+        echo "salchang-probe: $dep not found on the tmux host; install it to see agent metadata" >&2
+        exit 2
+    fi
+done
+
+log() { [ "$VERBOSE" -eq 1 ] && echo "salchang-probe: $*" >&2; return 0; }
+
+# ---- process helpers ---------------------------------------------------------
+
+# Snapshot of "pid ppid" lines, refreshed once per probe.
+PS_TABLE=""
+
+descendants() {
+    _frontier=$1
+    _all=$1
+    while [ -n "$_frontier" ]; do
+        _next=""
+        for _p in $_frontier; do
+            _kids=$(printf '%s\n' "$PS_TABLE" | awk -v pp="$_p" '$2 == pp { printf "%s ", $1 }')
+            _next="$_next $_kids"
+        done
+        _frontier=$(printf '%s' "$_next" | tr -s ' ' | sed 's/^ //; s/ $//')
+        [ -n "$_frontier" ] && _all="$_all $_frontier"
+    done
+    printf '%s' "$_all"
+}
+
+proc_comm() {
+    if [ -r "/proc/$1/comm" ]; then
+        cat "/proc/$1/comm"
+    else
+        ps -o comm= -p "$1" 2>/dev/null | sed 's#.*/##'
+    fi
+}
+
+pane_proc() {
+    for _p in $PANE_PIDS; do
+        if [ "$(proc_comm "$_p")" = "$1" ]; then
+            printf '%s' "$_p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+proc_open_files() {
+    if [ -d "/proc/$1/fd" ]; then
+        for _l in "/proc/$1/fd"/*; do
+            readlink "$_l" 2>/dev/null
+        done
+    else
+        lsof -p "$1" -Fn 2>/dev/null | sed -n 's/^n//p'
+    fi
+}
+
+proc_start_epoch() {
+    _elapsed=$(ps -o etimes= -p "$1" 2>/dev/null | tr -d ' ')
+    [ -n "$_elapsed" ] || return 1
+    echo $(( $(date +%s) - _elapsed ))
+}
+
+file_mtime_epoch() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+last_line_matching() {
+    tail -n "${3:-$TAIL_LINES}" "$1" 2>/dev/null | grep -F -- "$2" | tail -n 1
+}
+
+# ---- detector: Claude Code -----------------------------------------------------
+# ~/.claude/sessions/<pid>.json is written by each running `claude` and names
+# its tmux pane ("tmux": "session:@window.%pane"). The transcript under
+# ~/.claude/projects/ has the model and token usage of the last turn.
+
+CLAUDE_INDEX=""
+
+# One line per live session file: "<pane-id-or--> <pid> <file>".
+prepare_claude_code() {
+    CLAUDE_INDEX=""
+    _dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    [ -d "$_dir/sessions" ] || return 0
+    for _f in "$_dir"/sessions/*.json; do
+        [ -f "$_f" ] || continue
+        _line=$(jq -r '[((.tmux // "") | split(".") | last | select(length > 0)) // "-", (.pid // empty), input_filename] | @tsv' "$_f" 2>/dev/null | tr '\t' ' ')
+        [ -n "$_line" ] || continue
+        _pid=${_line#* }
+        _pid=${_pid%% *}
+        kill -0 "$_pid" 2>/dev/null || continue
+        CLAUDE_INDEX="$CLAUDE_INDEX
+$_line"
+    done
+}
+
+detect_claude_code() {
+    [ -n "$CLAUDE_INDEX" ] || return 0
+    _dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    _f=$(printf '%s\n' "$CLAUDE_INDEX" | awk -v pane="$PANE_ID" -v pids=" $PANE_PIDS " \
+        '$1 == pane || index(pids, " " $2 " ") { print $3; exit }')
+    [ -n "$_f" ] && [ -r "$_f" ] || return 0
+    log "claude-code: $PANE_ID matches $_f"
+    _sid=$(jq -r '.sessionId // empty' "$_f")
+    _transcript=""
+    _last="null"
+    if [ -n "$_sid" ]; then
+        for _t in "$_dir"/projects/*/"$_sid".jsonl; do
+            [ -f "$_t" ] && _transcript=$_t && break
+        done
+    fi
+    if [ -n "$_transcript" ]; then
+        _last=$(last_line_matching "$_transcript" '"type":"assistant"' | jq -c '.message | {model, usage}' 2>/dev/null)
+        [ -n "$_last" ] || _last="null"
+    fi
+    jq -n -c --slurpfile s "$_f" --argjson last "$_last" --arg transcript "$_transcript" \
+        --argjson win "$CLAUDE_CONTEXT_WINDOW" --argjson win1m "$CLAUDE_CONTEXT_WINDOW_1M" '
+        $s[0] as $s |
+        ($last.usage // null) as $u |
+        {
+            kind: "claude-code",
+            agent_name: "Claude Code",
+            version: $s.version,
+            cwd: $s.cwd,
+            session_id: $s.sessionId,
+            title: $s.name,
+            status: $s.status,
+            started_at: (if $s.startedAt then ($s.startedAt / 1000 | floor) else null end),
+            model: $last.model,
+            context_used: (if $u then (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0) + ($u.cache_read_input_tokens // 0)) else null end),
+            context_window: (if $last.model then (if ($last.model | test("1m")) then $win1m else $win end) else null end),
+            data: {pid: $s.pid, tmux: $s.tmux, transcript: (if $transcript == "" then null else $transcript end)}
+        } | with_entries(select(.value != null))'
+}
+
+# ---- detector: Codex -----------------------------------------------------------
+# The codex process keeps its rollout file open, so /proc/<pid>/fd names the
+# session exactly. Fallback: newest rollout whose header cwd matches the pane.
+
+detect_codex() {
+    _home="${CODEX_HOME:-$HOME/.codex}"
+    [ -d "$_home/sessions" ] || return 0
+    _f=""
+    for _p in $PANE_PIDS; do
+        _f=$(proc_open_files "$_p" | grep -F -- "$_home/sessions/" | grep '\.jsonl$' | head -n 1)
+        [ -n "$_f" ] && break
+    done
+    if [ -z "$_f" ]; then
+        pane_proc codex >/dev/null || return 0
+        for _c in $(ls -t "$_home"/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -n 20); do
+            if head -n 1 "$_c" | jq -e --arg cwd "$PANE_CWD" '.payload.cwd == $cwd' >/dev/null 2>&1; then
+                _f=$_c
+                break
+            fi
+        done
+    fi
+    [ -n "$_f" ] && [ -r "$_f" ] || return 0
+    log "codex: $PANE_ID matches $_f"
+    _head=$(head -n 1 "$_f" | jq -c '.payload // {}' 2>/dev/null)
+    [ -n "$_head" ] || _head="{}"
+    _model=$(head -n 50 "$_f" | grep -F '"turn_context"' | head -n 1 | jq -r '.payload.model // empty' 2>/dev/null)
+    _tokens=$(last_line_matching "$_f" '"token_count"' | jq -c '.payload // null' 2>/dev/null)
+    [ -n "$_tokens" ] || _tokens="null"
+    _id=$(printf '%s' "$_head" | jq -r '.id // empty')
+    _title=""
+    if [ -n "$_id" ] && [ -r "$_home/session_index.jsonl" ]; then
+        _title=$(grep -F -- "\"$_id\"" "$_home/session_index.jsonl" | tail -n 1 | jq -r '.thread_name // empty' 2>/dev/null)
+    fi
+    # Last event tells us whether a turn is in flight.
+    _status=""
+    case "$(last_line_matching "$_f" '"event_msg"' | jq -r '.payload.type // empty' 2>/dev/null)" in
+        task_started|agent_message_delta|agent_reasoning_delta|exec_command_begin) _status="busy" ;;
+        task_complete|turn_aborted) _status="idle" ;;
+    esac
+    jq -n -c --argjson head "$_head" --arg model "$_model" --argjson tokens "$_tokens" \
+        --arg title "$_title" --arg status "$_status" --arg file "$_f" '
+        {
+            kind: "codex",
+            agent_name: "Codex",
+            version: $head.cli_version,
+            cwd: $head.cwd,
+            session_id: $head.id,
+            title: (if $title == "" then null else $title end),
+            status: (if $status == "" then null else $status end),
+            started_at: (if $head.timestamp then ($head.timestamp | sub("\\.[0-9]+"; "") | fromdateiso8601) else null end),
+            model: (if $model == "" then null else $model end),
+            context_used: ($tokens.info.last_token_usage.total_tokens // null),
+            context_window: ($tokens.info.model_context_window // null),
+            data: ({rollout: $file, originator: $head.originator, rate_limits: $tokens.rate_limits} | with_entries(select(.value != null)))
+        } | with_entries(select(.value != null))'
+}
+
+# ---- detector: Pi ----------------------------------------------------------------
+# Pi keeps nothing open; its session file lives under a directory derived from
+# the cwd and is created shortly after the process starts.
+
+detect_pi() {
+    _pid=$(pane_proc pi) || return 0
+    _dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions"
+    [ -d "$_dir" ] || return 0
+    _start=$(proc_start_epoch "$_pid") || _start=0
+    _start=$(( _start - PI_START_SLACK_SECS ))
+    _f=""
+    for _c in $(ls -t "$_dir"/*/*.jsonl 2>/dev/null | head -n 20); do
+        _m=$(file_mtime_epoch "$_c") || continue
+        [ "$_m" -ge "$_start" ] || break
+        if head -n 1 "$_c" | jq -e --arg cwd "$PANE_CWD" '.type == "session" and .cwd == $cwd' >/dev/null 2>&1; then
+            _f=$_c
+            break
+        fi
+    done
+    [ -n "$_f" ] || return 0
+    log "pi: $PANE_ID matches $_f"
+    _head=$(head -n 1 "$_f" | jq -c '.' 2>/dev/null)
+    _model=$(last_line_matching "$_f" '"model_change"' | jq -c '{modelId, provider}' 2>/dev/null)
+    [ -n "$_model" ] || _model="null"
+    _last=$(last_line_matching "$_f" '"role":"assistant"' | jq -c '.message.usage // null' 2>/dev/null)
+    [ -n "$_last" ] || _last="null"
+    _cost=$(grep -F '"role":"assistant"' "$_f" | jq -s '[.[].message.usage.cost.total // 0] | add' 2>/dev/null)
+    [ -n "$_cost" ] || _cost="null"
+    _status=""
+    case "$(tail -n 1 "$_f" | jq -r 'if .type == "message" then .message.role else .type end' 2>/dev/null)" in
+        user|tool_result) _status="busy" ;;
+        assistant) _status="idle" ;;
+    esac
+    jq -n -c --argjson head "$_head" --argjson model "$_model" --argjson last "$_last" \
+        --argjson cost "$_cost" --arg status "$_status" --arg file "$_f" '
+        {
+            kind: "pi",
+            agent_name: "Pi",
+            cwd: $head.cwd,
+            session_id: $head.id,
+            status: (if $status == "" then null else $status end),
+            started_at: (if $head.timestamp then ($head.timestamp | sub("\\.[0-9]+"; "") | fromdateiso8601) else null end),
+            model: ($model.modelId // null),
+            context_used: (if $last then (($last.input // 0) + ($last.cacheRead // 0) + ($last.cacheWrite // 0)) else null end),
+            cost_usd: $cost,
+            data: {session_file: $file, provider: ($model.provider // null)}
+        } | with_entries(select(.value != null))'
+}
+
+# ---- drop-in detectors -----------------------------------------------------------
+
+if [ -d "$DROPIN_DIR" ]; then
+    for _dropin in "$DROPIN_DIR"/*.sh; do
+        [ -r "$_dropin" ] || continue
+        log "loading $_dropin"
+        # shellcheck disable=SC1090
+        . "$_dropin"
+    done
+fi
+
+# ---- publishing ---------------------------------------------------------------------
+
+publish() {
+    _pane=$1
+    _meta=$2
+    _current=$(tmux $TMUX_ARGS show-options -pqv -t "$_pane" "$META_OPTION" 2>/dev/null)
+    _cur_source=""
+    _cur_kind=""
+    if [ -n "$_current" ]; then
+        _cur_source=$(printf '%s' "$_current" | jq -r '(.source // "") + " " + (.kind // "")' 2>/dev/null)
+        _cur_kind=${_cur_source#* }
+        _cur_source=${_cur_source%% *}
+    fi
+    if [ -n "$_meta" ]; then
+        _kind=$(printf '%s' "$_meta" | jq -r '.kind // empty')
+        # The status-line hook knows more than we do about its own harness;
+        # a hand-set value (no source) is never touched.
+        if [ -n "$_current" ] && [ "$_cur_source" != "probe" ]; then
+            if [ "$_cur_source" = "statusline" ] && [ "$_cur_kind" != "$_kind" ]; then
+                :
+            else
+                log "$_pane: keeping existing $_cur_source value"
+                return 0
+            fi
+        fi
+        _payload=$(printf '%s' "$_meta" | jq -c '. + {source: "probe", updated_at: (now | floor)}')
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf '%s\t%s\n' "$_pane" "$_payload"
+            return 0
+        fi
+        # Our own payloads always end in ,"updated_at":N} so no jq is needed here.
+        if [ -n "$_current" ] && [ "$(printf '%s' "$_current" | sed 's/,"updated_at":[0-9]*}$/}/')" = "$(printf '%s' "$_payload" | sed 's/,"updated_at":[0-9]*}$/}/')" ]; then
+            return 0
+        fi
+        tmux $TMUX_ARGS set-option -p -t "$_pane" "$META_OPTION" "$_payload" >/dev/null 2>&1 || log "$_pane: set-option failed"
+    else
+        case "$_cur_source" in
+            probe|statusline)
+                if [ "$DRY_RUN" -eq 1 ]; then
+                    printf '%s\t(unset stale %s value)\n' "$_pane" "$_cur_source"
+                else
+                    tmux $TMUX_ARGS set-option -pu -t "$_pane" "$META_OPTION" >/dev/null 2>&1 || log "$_pane: unset failed"
+                fi
+                ;;
+        esac
+    fi
+}
+
+probe_once() {
+    PS_TABLE=$(ps -e -o pid=,ppid=)
+    for _d in $DETECTORS; do
+        if command -v "prepare_$_d" >/dev/null 2>&1; then "prepare_$_d"; fi
+    done
+    _panes=0
+    _agents=0
+    # Grouped sessions share windows, so -a lists a pane once per session.
+    _list=$(tmux $TMUX_ARGS list-panes -a -F '#{pane_id} #{pane_pid} #{pane_current_command} #{pane_current_path}' | awk '!seen[$1]++') || {
+        echo "salchang-probe: tmux list-panes failed" >&2
+        return 1
+    }
+    while read -r PANE_ID PANE_PID PANE_CMD PANE_CWD; do
+        [ -n "$PANE_ID" ] || continue
+        _panes=$(( _panes + 1 ))
+        PANE_PIDS=$(descendants "$PANE_PID")
+        PANE_PIDS_JSON=$(printf '%s' "$PANE_PIDS" | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber)')
+        _meta=""
+        for _d in $DETECTORS; do
+            if [ "$VERBOSE" -eq 1 ]; then
+                _meta=$("detect_$_d")
+            else
+                _meta=$("detect_$_d" 2>/dev/null)
+            fi
+            [ -n "$_meta" ] && break
+        done
+        [ -n "$_meta" ] && _agents=$(( _agents + 1 ))
+        publish "$PANE_ID" "$_meta"
+    done <<EOF
+$_list
+EOF
+    echo "probe: $_panes panes, $_agents agents"
+}
+
+trap 'exit 0' HUP PIPE TERM INT
+
+if [ "$ONCE" -eq 1 ]; then
+    probe_once
+    exit $?
+fi
+while :; do
+    probe_once || true
+    sleep "$INTERVAL"
+done
