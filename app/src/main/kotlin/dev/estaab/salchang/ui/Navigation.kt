@@ -29,6 +29,7 @@ fun SalchangNavHost(app: SalchangApp) {
         composable(Routes.HOSTS) {
             HostsScreen(
                 repository = app.hostRepository,
+                lastWindowStore = app.lastWindowStore,
                 onOpenSession = { id -> navController.navigate(Routes.session(id)) },
                 onAddHost = { navController.navigate(Routes.HOST_NEW) },
                 onEditHost = { id -> navController.navigate(Routes.hostEdit(id)) },
