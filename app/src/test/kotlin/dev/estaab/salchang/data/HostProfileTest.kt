@@ -13,7 +13,6 @@ class HostProfileTest {
             hostname = "desk.tailnet.ts.net",
             port = 2222,
             username = "estaab",
-            keyId = "abc",
             tmuxSession = "work 'stuff'",
             tmuxSocketName = "dev",
             tmuxSocketPath = null,
@@ -27,7 +26,7 @@ class HostProfileTest {
     fun defaultsAreAppliedWhenFieldsMissing() {
         val decoded: HostProfile = Json.decodeFromString(
             HostProfile.serializer(),
-            """{"id":"x","name":"n","hostname":"h","username":"u","keyId":null}""",
+            """{"id":"x","name":"n","hostname":"h","username":"u"}""",
         )
         assertEquals(DEFAULT_SSH_PORT, decoded.port)
         assertEquals(DEFAULT_TMUX_SESSION, decoded.tmuxSession)
@@ -36,25 +35,16 @@ class HostProfileTest {
     }
 
     @Test
-    fun authMethodDefaultsToNoneWhenMissing() {
-        val decoded: HostProfile = Json.decodeFromString(
-            HostProfile.serializer(),
-            """{"id":"x","name":"n","hostname":"h","username":"u","keyId":"k"}""",
-        )
-        assertEquals(AuthMethod.NONE, decoded.authMethod)
-        assertEquals("k", decoded.keyId)
-    }
-
-    @Test
-    fun authMethodRoundTrips() {
-        val profile = HostProfile(id = "a", name = "a", hostname = "a", username = "u", keyId = "k", authMethod = AuthMethod.KEY)
-        val text: String = Json.encodeToString(HostProfile.serializer(), profile)
-        assertEquals(profile, Json.decodeFromString(HostProfile.serializer(), text))
+    fun legacyAuthFieldsAreIgnored() {
+        val decoded: HostProfile = HostRepository.decode(
+            """[{"id":"x","name":"n","hostname":"h","username":"u","keyId":"k","authMethod":"KEY"}]""",
+        ).single()
+        assertEquals("x", decoded.id)
     }
 
     @Test
     fun repositoryListEncodingRoundTrips() {
-        val a = HostProfile(id = "a", name = "a", hostname = "a", username = "u", keyId = null)
+        val a = HostProfile(id = "a", name = "a", hostname = "a", username = "u")
         val b = a.copy(id = "b", name = "b")
         assertEquals(listOf(a, b), HostRepository.decode(HostRepository.encode(listOf(a, b))))
         assertEquals(emptyList<HostProfile>(), HostRepository.decode(null))

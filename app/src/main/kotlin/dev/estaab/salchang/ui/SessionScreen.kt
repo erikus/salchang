@@ -167,7 +167,7 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
                     if (prefixArmed) PrefixChip()
                     when (connection) {
                         is ConnectionState.Connected -> TextButton(onClick = { controller.disconnect() }) { Text("Disconnect") }
-                        is ConnectionState.Connecting, is ConnectionState.NeedsPassphrase -> Unit
+                        is ConnectionState.Connecting -> Unit
                         else -> TextButton(onClick = { controller.connect() }) { Text("Reconnect") }
                     }
                 },
@@ -219,12 +219,6 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
             onAccept = { p.reply.complete(true) },
             onReject = { p.reply.complete(false) },
         )
-        is SessionPrompt.Passphrase -> PassphraseDialog(
-            title = "Unlock ${p.keyName}",
-            message = null,
-            onDismiss = { p.reply.complete(null) },
-            onConfirm = { p.reply.complete(it) },
-        )
     }
 
     when (val d: WindowDialog? = windowDialog) {
@@ -265,7 +259,6 @@ private fun PrefixChip() {
 private fun ConnectionBanner(connection: ConnectionState) {
     val (text: String?, isError: Boolean) = when (val c: ConnectionState = connection) {
         is ConnectionState.Connecting -> "Connecting..." to false
-        is ConnectionState.NeedsPassphrase -> "Waiting for passphrase" to false
         is ConnectionState.Connected -> null to false
         is ConnectionState.Disconnected -> (c.reason?.let { "Disconnected: $it" } ?: "Disconnected") to false
         is ConnectionState.Failed -> "Connection failed: ${c.error.message ?: c.error.javaClass.simpleName}" to true

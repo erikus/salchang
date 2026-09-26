@@ -40,7 +40,6 @@ class SessionViewModel(application: Application, val hostId: String) : AndroidVi
             }
             val controller = SessionController(
                 profile = profile,
-                keyStore = app.keyStore,
                 knownHostsFactory = { prompt -> app.knownHosts(prompt) },
                 copyToClipboard = { text -> copyToClipboard(text) },
                 scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),

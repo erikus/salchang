@@ -10,9 +10,6 @@ sealed interface ConnectionState {
      */
     data class Connecting(val message: String? = null) : ConnectionState
 
-    /** Waiting for the user to type the key passphrase (see [SessionPrompt.Passphrase]). */
-    data object NeedsPassphrase : ConnectionState
-
     /** Attached to tmux; terminals are live. */
     data object Connected : ConnectionState
 
@@ -35,11 +32,5 @@ sealed interface SessionPrompt {
         val keyType: String,
         val fingerprintSha256: String,
         val reply: CompletableDeferred<Boolean>,
-    ) : SessionPrompt
-
-    /** The selected private key is encrypted. Reply null to abort connecting. */
-    data class Passphrase(
-        val keyName: String,
-        val reply: CompletableDeferred<CharArray?>,
     ) : SessionPrompt
 }

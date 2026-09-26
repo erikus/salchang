@@ -8,7 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SshControlTransportTest {
-    private val base = HostProfile(id = "1", name = "box", hostname = "box.tail", username = "me", keyId = "k")
+    private val base = HostProfile(id = "1", name = "box", hostname = "box.tail", username = "me")
 
     @Test
     fun defaultSocketUsesNoSocketFlag() {

@@ -31,7 +31,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## General Setup
 
-In the app, add the host (i.e. hostname, user, authentication, tmux session). The
+In the app, add the host (i.e. hostname, user, tmux session). The
 "tmux session" field is the session *group* (or ungrouped session) name passed to
 `new-session -t`; tap "Browse" next to it to connect once over SSH, list what the
 host's tmux server has, and pick one instead of guessing (a wrong name
@@ -68,14 +68,12 @@ Bindings that need tmux's interactive UI (`command-prompt`, `confirm-before`, `d
 
 ## Authentication
 
-- **Tailscale SSH** needs no key: pick "None (Tailscale SSH)" for the host. The
-  server authenticates by tailnet identity and accepts the SSH `none` method.
-  If your ACL uses check mode, the approval URL the server sends is shown in the
-  connection banner while connecting.
-- **SSH key** (plain sshd): either generate an ed25519 key under Keys and add its
-  public key to `~/.ssh/authorized_keys` on the host, or get an existing OpenSSH
-  private key file onto the phone (Taildrop, USB, `adb push`) and Import it.
-  Encrypted keys ask for their passphrase at connect time.
+The host must run [Tailscale SSH](https://tailscale.com/kb/1193/tailscale-ssh):
+the app sends the SSH `none` method and the server authenticates by tailnet
+identity, so there are no keys or passwords to manage on the phone. If your ACL
+uses check mode, the approval URL the server sends is shown in the connection
+banner while connecting. Plain sshd (public-key or password auth) is not
+supported.
 
 ## Development
 

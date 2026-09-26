@@ -3,10 +3,7 @@ package dev.estaab.salchang.session
 import android.util.Log
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSink
-import dev.estaab.salchang.data.AuthMethod
 import dev.estaab.salchang.data.HostProfile
-import dev.estaab.salchang.data.KeyInfo
-import dev.estaab.salchang.data.KeyStore
 import dev.estaab.salchang.meta.WindowMeta
 import dev.estaab.salchang.ssh.HostKeyPrompt
 import dev.estaab.salchang.ssh.KnownHosts
@@ -71,7 +68,6 @@ private const val LIST_ROOT_KEYS_COMMAND: String = "list-keys -T root"
  */
 class SessionController(
     val profile: HostProfile,
-    private val keyStore: KeyStore,
     knownHostsFactory: (HostKeyPrompt) -> KnownHosts,
     private val copyToClipboard: (String) -> Unit,
     private val scope: CoroutineScope,
@@ -153,37 +149,13 @@ class SessionController(
     private suspend fun runConnect() {
         teardown()
         _connectionState.value = ConnectionState.Connecting()
-        var passphrase: CharArray? = null
-        if (profile.authMethod == AuthMethod.KEY) {
-            val keyId: String? = profile.keyId
-            if (keyId == null) {
-                _connectionState.value = ConnectionState.Failed(IllegalStateException("No SSH key selected for this host"))
-                return
-            }
-            val key: KeyInfo? = withContext(Dispatchers.IO) { keyStore.get(keyId) }
-            if (key == null) {
-                _connectionState.value = ConnectionState.Failed(IllegalStateException("The selected SSH key no longer exists"))
-                return
-            }
-            if (key.encrypted) {
-                _connectionState.value = ConnectionState.NeedsPassphrase
-                passphrase = askPassphrase(key.name)
-                if (passphrase == null) {
-                    _connectionState.value = ConnectionState.Disconnected("Passphrase required")
-                    return
-                }
-                _connectionState.value = ConnectionState.Connecting()
-            }
-        }
         val transport: SshControlTransport = try {
-            SshControlTransport.connect(profile, keyStore, passphrase, knownHosts, onAuthBanner = ::onAuthBanner)
+            SshControlTransport.connect(profile, knownHosts, onAuthBanner = ::onAuthBanner)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             _connectionState.value = ConnectionState.Failed(e)
             return
-        } finally {
-            passphrase?.fill('\u0000')
         }
         this.transport = transport
         val client = TmuxControlClient(transport, scope)
@@ -290,7 +262,6 @@ class SessionController(
     private fun cancelPrompt(prompt: SessionPrompt) {
         when (prompt) {
             is SessionPrompt.HostKey -> prompt.reply.complete(false)
-            is SessionPrompt.Passphrase -> prompt.reply.complete(null)
         }
         _prompt.compareAndSet(prompt, null)
     }
@@ -310,16 +281,6 @@ class SessionController(
     private fun onAuthBanner(banner: String) {
         _connectionState.update { state ->
             if (state is ConnectionState.Connecting) ConnectionState.Connecting(banner.trim()) else state
-        }
-    }
-
-    private suspend fun askPassphrase(keyName: String): CharArray? {
-        val prompt = SessionPrompt.Passphrase(keyName, CompletableDeferred())
-        _prompt.value = prompt
-        return try {
-            prompt.reply.await()
-        } finally {
-            _prompt.compareAndSet(prompt, null)
         }
     }
 

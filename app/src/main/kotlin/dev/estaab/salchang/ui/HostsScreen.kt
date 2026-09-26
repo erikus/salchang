@@ -10,7 +10,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
@@ -35,7 +34,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import dev.estaab.salchang.data.AuthMethod
 import dev.estaab.salchang.data.HostProfile
 import dev.estaab.salchang.data.HostRepository
 import kotlinx.coroutines.launch
@@ -50,7 +48,6 @@ fun HostsScreen(
     onOpenSession: (String) -> Unit,
     onAddHost: () -> Unit,
     onEditHost: (String) -> Unit,
-    onOpenKeys: () -> Unit,
 ) {
     val hosts: List<HostProfile> by repository.hosts.collectAsState(initial = emptyList())
     val scope = rememberCoroutineScope()
@@ -58,12 +55,7 @@ fun HostsScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("salchang") },
-                actions = {
-                    IconButton(onClick = onOpenKeys) { Icon(Icons.Default.Key, contentDescription = "Keys") }
-                },
-            )
+            TopAppBar(title = { Text("salchang") })
         },
         floatingActionButton = {
             FloatingActionButton(onClick = onAddHost) { Icon(Icons.Default.Add, contentDescription = "Add host") }
@@ -72,8 +64,7 @@ fun HostsScreen(
         if (hosts.isEmpty()) {
             Box(Modifier.fillMaxSize().padding(padding).padding(EMPTY_HINT_PADDING), contentAlignment = Alignment.Center) {
                 Text(
-                    "No hosts yet. Tap + to add a tmux host. Tailscale SSH needs no key; " +
-                        "otherwise add one under Keys first.",
+                    "No hosts yet. Tap + to add a tmux host reachable over Tailscale SSH.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -97,7 +88,7 @@ fun HostsScreen(
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
             title = { Text("Delete ${host.name}?") },
-            text = { Text("The saved host profile is removed. Keys and known hosts are kept.") },
+            text = { Text("The saved host profile is removed. Known hosts are kept.") },
             confirmButton = {
                 TextButton(onClick = {
                     pendingDelete = null
@@ -107,11 +98,6 @@ fun HostsScreen(
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel") } },
         )
     }
-}
-
-private fun authLabel(method: AuthMethod): String = when (method) {
-    AuthMethod.NONE -> "tailscale ssh"
-    AuthMethod.KEY -> "key"
 }
 
 @Composable
@@ -124,11 +110,6 @@ private fun HostRow(host: HostProfile, onClick: () -> Unit, onEdit: () -> Unit, 
             Column {
                 Text("${host.username}@${host.hostname}:${host.port}")
                 Text("tmux session: ${host.tmuxSession}", style = MaterialTheme.typography.bodySmall)
-                Text(
-                    authLabel(host.authMethod),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
             }
         },
         trailingContent = {

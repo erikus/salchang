@@ -37,7 +37,6 @@ kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-t
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
 sshj = { module = "com.hierynomus:sshj", version.ref = "sshj" }
 bouncycastle-prov = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = "bouncycastle" }
-bouncycastle-pkix = { module = "org.bouncycastle:bcpkix-jdk18on", version.ref = "bouncycastle" }
 slf4j-android = { module = "uk.uuid.slf4j:slf4j-android", version.ref = "slf4jAndroid" }
 junit = { module = "junit:junit", version.ref = "junit" }
 

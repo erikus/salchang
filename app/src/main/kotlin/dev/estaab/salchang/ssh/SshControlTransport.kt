@@ -1,8 +1,6 @@
 package dev.estaab.salchang.ssh
 
-import dev.estaab.salchang.data.AuthMethod
 import dev.estaab.salchang.data.HostProfile
-import dev.estaab.salchang.data.KeyStore
 import dev.estaab.salchang.tmuxctl.ControlTransport
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -20,7 +18,6 @@ import net.schmizz.sshj.DefaultConfig
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.transport.TransportException
-import net.schmizz.sshj.userauth.keyprovider.KeyProvider
 import net.schmizz.sshj.userauth.method.AuthNone
 import java.io.IOException
 import java.io.InputStream
@@ -65,13 +62,11 @@ data class TmuxAttachTarget(
  * [ControlTransport] over an sshj exec channel running `tmux -C`.
  *
  * Failure modes of [connect], for the UI:
- * - `com.hierynomus.sshj.common.KeyDecryptionFailedException`: wrong/missing key passphrase
- *   (raised before any network I/O).
  * - `java.net.UnknownHostException`, `java.net.ConnectException`, `java.net.SocketTimeoutException`:
  *   network / DNS / TCP problems (plain `IOException`s, not `SSHException`s).
  * - [HostKeyMismatchException] / [HostKeyRejectedException]: host key problems.
- * - `net.schmizz.sshj.userauth.UserAuthException`: server refused the key, or (for
- *   [AuthMethod.NONE]) does not accept the `none` method, i.e. it is not Tailscale SSH.
+ * - `net.schmizz.sshj.userauth.UserAuthException`: the server does not accept the `none`
+ *   method, i.e. it is not Tailscale SSH.
  * - `net.schmizz.sshj.transport.TransportException`: other protocol failures / connection lost.
  * - `net.schmizz.sshj.connection.ConnectionException`: session channel / exec request refused.
  */
@@ -127,8 +122,8 @@ class SshControlTransport private constructor(
         /**
          * Bound on each protocol step (key exchange, auth, channel open) and the socket read
          * timeout. It also bounds how long the host-key prompt may stay open, because the KEX
-         * waits on it; see [TofuHostKeyVerifier]. With [AuthMethod.NONE] against Tailscale SSH
-         * in check mode it likewise bounds how long the user has to visit the approval URL,
+         * waits on it; see [TofuHostKeyVerifier]. Against Tailscale SSH in check mode it
+         * likewise bounds how long the user has to visit the approval URL,
          * because the server holds the auth request open until then. Idle reads time out
          * harmlessly (sshj's reader loops on `SocketTimeoutException`), liveness comes from the
          * keepalive below.
@@ -175,7 +170,7 @@ class SshControlTransport private constructor(
         private val NO_SERVER_MARKERS: List<String> = listOf("no server running", "error connecting", "server exited unexpectedly")
 
         /**
-         * Connects, authenticates per [HostProfile.authMethod] and starts `tmux -C new-session -t <session>`.
+         * Connects with the SSH `none` method and starts `tmux -C new-session -t <session>`.
          * Runs on [Dispatchers.IO]. On any failure the client is closed before the exception propagates.
          * [onAuthBanner] is called at most once, from an IO thread, with the auth banner as soon as
          * the server sends one (see [authBanner]).
@@ -187,13 +182,11 @@ class SshControlTransport private constructor(
          */
         suspend fun connect(
             profile: HostProfile,
-            keyStore: KeyStore,
-            passphrase: CharArray?,
             knownHosts: KnownHosts,
             onAuthBanner: ((String) -> Unit)? = null,
         ): SshControlTransport {
             val transport: SshControlTransport = withContext(Dispatchers.IO + NonCancellable) {
-                val client: SSHClient = openAuthenticatedClient(profile, keyStore, passphrase, knownHosts, onAuthBanner)
+                val client: SSHClient = openAuthenticatedClient(profile, knownHosts, onAuthBanner)
                 try {
                     val session: Session = client.startSession()
                     val command: Session.Command = session.exec(buildTmuxCommand(profile))
@@ -216,13 +209,11 @@ class SshControlTransport private constructor(
          */
         suspend fun runOnce(
             profile: HostProfile,
-            keyStore: KeyStore,
-            passphrase: CharArray?,
             knownHosts: KnownHosts,
             command: String,
             onAuthBanner: ((String) -> Unit)? = null,
         ): String = withContext(Dispatchers.IO) {
-            val client: SSHClient = openAuthenticatedClient(profile, keyStore, passphrase, knownHosts, onAuthBanner)
+            val client: SSHClient = openAuthenticatedClient(profile, knownHosts, onAuthBanner)
             try {
                 client.startSession().use { session ->
                     val cmd: Session.Command = session.exec(command)
@@ -329,23 +320,9 @@ class SshControlTransport private constructor(
 
         private suspend fun openAuthenticatedClient(
             profile: HostProfile,
-            keyStore: KeyStore,
-            passphrase: CharArray?,
             knownHosts: KnownHosts,
             onAuthBanner: ((String) -> Unit)?,
         ): SSHClient {
-            val keyProvider: KeyProvider? = when (profile.authMethod) {
-                AuthMethod.NONE -> null
-                AuthMethod.KEY -> {
-                    val keyId: String = profile.keyId
-                        ?: throw IllegalArgumentException("host '${profile.name}' uses key authentication but has no key selected")
-                    keyStore.keyProvider(keyId, passphrase).also {
-                        // Decrypt now so a bad passphrase fails before we touch the network.
-                        it.getPrivate()
-                    }
-                }
-            }
-
             val verifier: TofuHostKeyVerifier = knownHosts.createVerifier()
             val config = DefaultConfig()
             config.keepAliveProvider = KeepAliveProvider.KEEP_ALIVE
@@ -364,7 +341,7 @@ class SshControlTransport private constructor(
                 } catch (e: TransportException) {
                     throw verifier.takeFailure() ?: e
                 }
-                authenticate(client, profile.username, keyProvider, onAuthBanner)
+                authenticate(client, profile.username, onAuthBanner)
             } catch (e: Throwable) {
                 closeQuietly(client)
                 throw e
@@ -373,19 +350,17 @@ class SshControlTransport private constructor(
         }
 
         /**
-         * Runs the blocking sshj auth (publickey with [keyProvider], `none` without) while a
-         * sibling coroutine samples the banner every [AUTH_BANNER_POLL_MS] and reports it once.
+         * Runs the blocking sshj `none` auth while a sibling coroutine samples the banner every [AUTH_BANNER_POLL_MS] and reports it once.
          * A banner that arrived right before auth finished is reported after the fact, so
          * [onAuthBanner] sees it exactly once either way.
          */
         private suspend fun authenticate(
             client: SSHClient,
             username: String,
-            keyProvider: KeyProvider?,
             onAuthBanner: ((String) -> Unit)?,
         ) {
             if (onAuthBanner == null) {
-                authenticateBlocking(client, username, keyProvider)
+                authenticateBlocking(client, username)
                 return
             }
             val reported = AtomicBoolean(false)
@@ -402,7 +377,7 @@ class SshControlTransport private constructor(
                     }
                 }
                 try {
-                    authenticateBlocking(client, username, keyProvider)
+                    authenticateBlocking(client, username)
                 } finally {
                     poller.cancel()
                 }
@@ -410,8 +385,8 @@ class SshControlTransport private constructor(
             reportBannerOnce()
         }
 
-        private fun authenticateBlocking(client: SSHClient, username: String, keyProvider: KeyProvider?) {
-            if (keyProvider == null) client.auth(username, AuthNone()) else client.authPublickey(username, keyProvider)
+        private fun authenticateBlocking(client: SSHClient, username: String) {
+            client.auth(username, AuthNone())
         }
 
         private fun closeQuietly(closeable: AutoCloseable?) {

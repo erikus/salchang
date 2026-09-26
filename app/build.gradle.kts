@@ -65,7 +65,6 @@ dependencies {
 
     implementation(libs.sshj)
     implementation(libs.bouncycastle.prov)
-    implementation(libs.bouncycastle.pkix)
     implementation(libs.slf4j.android)
 
     testImplementation(libs.junit)

@@ -15,7 +15,6 @@ object Routes {
     const val HOST_NEW: String = "hosts/new"
     const val HOST_EDIT: String = "hosts/{hostId}/edit"
     const val SESSION: String = "session/{hostId}"
-    const val KEYS: String = "keys"
 
     const val ARG_HOST_ID: String = "hostId"
 
@@ -33,14 +32,12 @@ fun SalchangNavHost(app: SalchangApp) {
                 onOpenSession = { id -> navController.navigate(Routes.session(id)) },
                 onAddHost = { navController.navigate(Routes.HOST_NEW) },
                 onEditHost = { id -> navController.navigate(Routes.hostEdit(id)) },
-                onOpenKeys = { navController.navigate(Routes.KEYS) },
             )
         }
         composable(Routes.HOST_NEW) {
             HostEditScreen(
                 hostId = null,
                 repository = app.hostRepository,
-                keyStore = app.keyStore,
                 knownHostsFactory = { prompt -> app.knownHosts(prompt) },
                 onDone = { navController.popBackStack() },
             )
@@ -52,13 +49,9 @@ fun SalchangNavHost(app: SalchangApp) {
             HostEditScreen(
                 hostId = entry.arguments?.getString(Routes.ARG_HOST_ID),
                 repository = app.hostRepository,
-                keyStore = app.keyStore,
                 knownHostsFactory = { prompt -> app.knownHosts(prompt) },
                 onDone = { navController.popBackStack() },
             )
-        }
-        composable(Routes.KEYS) {
-            KeysScreen(keyStore = app.keyStore, onBack = { navController.popBackStack() })
         }
         composable(
             Routes.SESSION,

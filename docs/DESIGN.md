@@ -18,7 +18,7 @@ JSON Claude Code hands to status line scripts).
 | Panes | One window = one tab; the **active pane** is rendered; if a window has >1 pane, a chip row switches which pane is shown | Keeps windows first-class and v1 simple. |
 | Metadata transport | tmux **pane user option** `@salchang_meta`, pushed to the app via `refresh-client -B 'meta:%*:#{@salchang_meta}'` (`%subscription-changed`) | Same connection as everything else, no polling, no file paths to agree on. Verified with tmux 3.4: value round-trips JSON with `#`, `\`, `"`, `;` intact. Notifications are rate-limited by tmux to ~1/s. |
 | Metadata producer | `remote/salchang-statusline` — a Claude Code `statusLine` command that wraps the stdin JSON and stores it on the pane (`$TMUX_PANE`) | The agent already runs it; nothing new to instruct. Other producers can set the same option. |
-| Keys | Per host `authMethod`: `NONE` (SSH `none` method, for Tailscale SSH which authenticates by tailnet identity; a check-mode approval URL arrives as the SSH auth banner and is shown while connecting) or `KEY`. Keys: import OpenSSH private key file (SAF picker) or generate ed25519 in-app; stored in app-private storage; passphrase asked at connect time, never stored | Tailnet use; simple. |
+| Auth | Tailscale SSH only: the SSH `none` method, the server authenticates by tailnet identity; a check-mode approval URL arrives as the SSH auth banner and is shown while connecting. No keys or passwords on the phone. | Tailnet use; nothing to store or protect on the device. |
 | Host keys | TOFU: first connect shows fingerprint, accept stores it in app-private `known_hosts` | Standard. |
 | Input | `send-keys -t %N -H <hex bytes>` only | Sidesteps all tmux quoting. |
 | Key bindings | Emulated client-side: the prefix key and the `prefix`/`root` key tables are loaded after connect (`show-options -gv prefix`, `list-keys -T prefix`, `list-keys -T root`); typed bytes are tokenized into keys, a matched binding runs its command on the control channel, everything else goes to `send-keys` | `send-keys -H` bypasses tmux's key tables, so tmux never sees the prefix (it printed literally). Interactive commands (`command-prompt`, `confirm-before`, `display-menu`, `choose-*`, `copy-mode`) do nothing useful in control mode and are not supported. |
@@ -31,7 +31,7 @@ salchang/
   settings.gradle.kts, build.gradle.kts, gradle/libs.versions.toml
   tmuxctl/      Kotlin JVM library: control-mode client (no Android deps)
   terminal/     Android library: vendored Termux emulator + view (Java)
-  app/          Android app: SSH transport (sshj), Compose UI, key store
+  app/          Android app: SSH transport (sshj), Compose UI
   remote/       scripts to install on the tmux host (status line)
   docs/         this file
 ```
@@ -105,7 +105,7 @@ Everything under `com.termux.terminal` / `com.termux.view` otherwise unchanged.
 ### app
 
 - `ssh/`: `SshControlTransport` — sshj `SSHClient` → exec `tmux -C new-session -t <session>` (+ optional `-L socket`/`-S path`); implements `ControlTransport`. Host key TOFU via `OpenSSHKnownHosts` in app files dir. `AndroidCrypto.install()` swaps the BC provider once at app start.
-- `data/`: `HostProfile` (name, hostname, port, user, authMethod, keyId, tmuxSession, tmuxSocket) persisted with DataStore/JSON; `KeyStore` (files dir; generate ed25519 with BC; import via SAF).
+- `data/`: `HostProfile` (name, hostname, port, user, tmuxSession, tmuxSocket) persisted with DataStore/JSON.
 - `session/`: `SessionController` — owns SSH + `TmuxControlClient`, one `TerminalSession`/emulator per pane, bootstraps each pane with `capturePane`, feeds `%output` bytes to emulators, forwards typed bytes to `sendKeys`, parses `@salchang_meta` JSON per pane → window meta.
 - `ui/`: `HostsScreen`, `HostEditScreen` (its "Browse" button lists the host's tmux session groups/sessions via a one-off SSH exec of `tmux list-sessions -F ...` — `SshControlTransport.runOnce` + `buildListSessionsCommand` — and fills the tmux session field with the group or session name that `new-session -t` needs), `SessionScreen` (top: window tab row + "+" — each tab shows `TmuxWindow.tabLabel()`, the server's rendered `window-status-format` with styles stripped, so the tabs match the user's own tmux status line and fall back to `index:name`; per window: Terminal | Info tabs; extra-keys bar Esc/Tab/Ctrl/Alt/arrows/Home/End/PgUp/PgDn like Termux; connection banner with reconnect).
 - Info tab renders the Claude Code payload: model, cwd/project, git branch/worktree, context used %, cost, duration, lines +/-, rate limits, updated-at; falls back to pretty-printed raw JSON for unknown payloads.
