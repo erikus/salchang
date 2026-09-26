@@ -4,6 +4,7 @@ import android.util.Log
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSink
 import dev.estaab.salchang.data.HostProfile
+import dev.estaab.salchang.data.LastWindowStore
 import dev.estaab.salchang.meta.WindowMeta
 import dev.estaab.salchang.ssh.HostKeyPrompt
 import dev.estaab.salchang.ssh.KnownHosts
@@ -68,6 +69,7 @@ private const val LIST_ROOT_KEYS_COMMAND: String = "list-keys -T root"
  */
 class SessionController(
     val profile: HostProfile,
+    private val lastWindowStore: LastWindowStore,
     knownHostsFactory: (HostKeyPrompt) -> KnownHosts,
     private val copyToClipboard: (String) -> Unit,
     private val scope: CoroutineScope,
@@ -116,6 +118,16 @@ class SessionController(
     private var clientRows: Int = TerminalSizing.DEFAULT_CLIENT_ROWS
 
     /**
+     * Whether [recordActiveWindow] persists window changes. False until a connect has restored
+     * the remembered window, so the group's default current window that a fresh grouped session
+     * starts on is not recorded over it. Main thread only.
+     */
+    private var recordWindows: Boolean = false
+
+    /** The window id last written to [lastWindowStore] for this host. Main thread only. */
+    private var recordedWindowId: String? = null
+
+    /**
      * Pane bootstraps awaiting tracked replies, keyed by both of their tokens (see [bootstrap]).
      * Main thread only.
      */
@@ -149,6 +161,7 @@ class SessionController(
     private suspend fun runConnect() {
         teardown()
         _connectionState.value = ConnectionState.Connecting()
+        val rememberedWindowId: String? = withContext(Dispatchers.IO) { lastWindowStore.get(profile.id) }
         val transport: SshControlTransport = try {
             SshControlTransport.connect(profile, knownHosts, onAuthBanner = ::onAuthBanner)
         } catch (e: CancellationException) {
@@ -160,12 +173,10 @@ class SessionController(
         this.transport = transport
         val client = TmuxControlClient(transport, scope)
         this.client = client
-        // UNDISPATCHED so both collectors are subscribed before start() sends anything.
+        // UNDISPATCHED so the collector is subscribed before start() sends anything. The state
+        // collector is started only after the remembered window is restored (see below).
         clientJobs += scope.launch(start = CoroutineStart.UNDISPATCHED) {
             client.events.collect { handleEvent(client, it) }
-        }
-        clientJobs += scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            client.state.collect { onTmuxState(it) }
         }
         val startCols: Int = clientCols
         val startRows: Int = clientRows
@@ -187,7 +198,55 @@ class SessionController(
         _connectionState.value = ConnectionState.Connected
         // The view may have reported its grid while we were connecting; tmux still has the size start() sent.
         if (clientCols != startCols || clientRows != startRows) scheduleClientSize(client)
+        restoreWindow(client, rememberedWindowId)
+        if (this.client !== client) return
+        // A StateFlow replays its current value on subscription, so nothing is missed by
+        // subscribing late; the UI never sees the pre-restore window as the active one.
+        clientJobs += scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            client.state.collect { onTmuxState(it) }
+        }
         loadKeyBindings(client)
+    }
+
+    /**
+     * Re-selects the window that was current when this host was last connected, if it still
+     * exists, then starts recording window changes (see [recordActiveWindow]). A failed
+     * `select-window` is not fatal: the session stays on tmux's default window.
+     */
+    private suspend fun restoreWindow(client: TmuxControlClient, rememberedWindowId: String?) {
+        val target: String? = windowToRestore(rememberedWindowId, client.state.value)
+        if (target != null) {
+            try {
+                client.selectWindow(target)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(LOG_TAG, "restoring window $target failed", e)
+            }
+        }
+        if (this.client !== client) return
+        recordedWindowId = rememberedWindowId
+        recordWindows = true
+    }
+
+    /**
+     * Persists [TmuxState.activeWindowId] when it differs from what was last written. No-op
+     * until [restoreWindow] has run for the current connection.
+     */
+    private fun recordActiveWindow(state: TmuxState) {
+        if (!recordWindows) return
+        val active: String = state.activeWindowId ?: return
+        if (active == recordedWindowId) return
+        recordedWindowId = active
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { lastWindowStore.set(profile.id, active) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(LOG_TAG, "remembering window $active failed", e)
+            }
+        }
     }
 
     /**
@@ -234,7 +293,7 @@ class SessionController(
      * otherwise just detach so the user's windows survive.
      */
     private suspend fun killOwnSessionIfGrouped(client: TmuxControlClient) {
-        val target: String = _tmuxState.value.sessionId ?: return
+        val target: String = client.state.value.sessionId ?: return
         val result: CommandResult = client.command("display-message -p '#{session_group_size}'")
         val size: Int = (result as? CommandResult.Success)?.lines?.firstOrNull()?.trim()?.toIntOrNull() ?: return
         if (size > 1) client.command("kill-session -t $target")
@@ -242,6 +301,7 @@ class SessionController(
 
     /** Closes client/transport, drops terminals. Safe to call repeatedly; does not touch [connectionState]. */
     private fun teardown() {
+        recordWindows = false
         resizeJob?.cancel()
         resizeJob = null
         clientJobs.forEach { it.cancel() }
@@ -311,6 +371,7 @@ class SessionController(
 
     private fun onTmuxState(state: TmuxState) {
         _tmuxState.value = state
+        recordActiveWindow(state)
         val current: Map<String, PaneTerminal> = _terminals.value
         if (current.isEmpty()) return
         var next: MutableMap<String, PaneTerminal>? = null
@@ -534,6 +595,17 @@ class SessionController(
     fun parseMeta(raw: String): WindowMeta = metaCache.getOrPut(raw) { WindowMeta.parse(raw) }
 
     companion object {
+        /**
+         * The window a fresh connection should switch to: [rememberedWindowId] if it is still in
+         * [state] and not already current; null when there is nothing to do.
+         */
+        fun windowToRestore(rememberedWindowId: String?, state: TmuxState): String? {
+            if (rememberedWindowId == null) return null
+            if (rememberedWindowId == state.activeWindowId) return null
+            if (state.window(rememberedWindowId) == null) return null
+            return rememberedWindowId
+        }
+
         /**
          * How many blank lines to append after a trimmed capture so that the pane's visible
          * screen occupies the emulator's screen rows: the capture (`-S -[DEFAULT_HISTORY_LINES]`)

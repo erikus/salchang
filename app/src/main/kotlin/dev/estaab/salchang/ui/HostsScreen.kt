@@ -36,6 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.estaab.salchang.data.HostProfile
 import dev.estaab.salchang.data.HostRepository
+import dev.estaab.salchang.data.LastWindowStore
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.collectAsState
 
@@ -45,6 +46,7 @@ private val EMPTY_HINT_PADDING = 32.dp
 @Composable
 fun HostsScreen(
     repository: HostRepository,
+    lastWindowStore: LastWindowStore,
     onOpenSession: (String) -> Unit,
     onAddHost: () -> Unit,
     onEditHost: (String) -> Unit,
@@ -92,7 +94,10 @@ fun HostsScreen(
             confirmButton = {
                 TextButton(onClick = {
                     pendingDelete = null
-                    scope.launch { repository.delete(host.id) }
+                    scope.launch {
+                        repository.delete(host.id)
+                        lastWindowStore.clear(host.id)
+                    }
                 }) { Text("Delete") }
             },
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel") } },
