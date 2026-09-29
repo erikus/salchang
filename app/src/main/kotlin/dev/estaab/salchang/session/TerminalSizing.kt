@@ -23,26 +23,53 @@ object TerminalSizing {
     data class Grid(val cols: Int, val rows: Int)
 
     /**
-     * Largest text size in `[minTextSize, maxTextSize]` whose glyph width (from [charWidthAt],
-     * monotonic in the text size) lets [paneCols] columns fit into [viewWidthPx]; [minTextSize]
-     * when even that does not fit (the view then scrolls horizontally). Units are whatever
-     * [charWidthAt] expects (the view uses pixels).
+     * Cell metrics of the monospace font at one text size, as `TerminalRenderer` computes them:
+     * [charWidth] is the advance of `X`, [lineSpacing] the (rounded up) font spacing and
+     * [lineSpacingAndAscent] that spacing plus the (negative) ascent, i.e. the top offset of the
+     * first row. A grid of `rows` rows needs `rows * lineSpacing + lineSpacingAndAscent` pixels.
+     */
+    data class CellMetrics(val charWidth: Float, val lineSpacing: Int, val lineSpacingAndAscent: Int) {
+        init {
+            require(charWidth > 0f && lineSpacing > 0) { "bad font metrics $charWidth / $lineSpacing" }
+        }
+
+        /** Pixel height of [rows] rows drawn with these metrics, the way `TerminalRenderer` lays them out. */
+        fun heightOf(rows: Int): Int = rows * lineSpacing + lineSpacingAndAscent
+
+        /** Rows that fit into [viewHeightPx], the formula `TerminalView.updateSize()` uses. */
+        fun rowsIn(viewHeightPx: Int): Int = (viewHeightPx - lineSpacingAndAscent) / lineSpacing
+    }
+
+    /**
+     * Largest text size in `[minTextSize, maxTextSize]` at which the whole [paneCols] x [paneRows]
+     * grid fits into a [viewWidthPx] x [viewHeightPx] view; [minTextSize] when even that does not fit
+     * (the view then scrolls horizontally and/or shows the bottom of the pane). [metricsAt] gives
+     * the cell metrics at a text size (both dimensions monotonic in the text size); units are
+     * whatever it expects (the view uses pixels). A dimension whose pane or view size is unknown
+     * (`<= 0`) is not constrained.
      */
     fun fitTextSize(
         paneCols: Int,
+        paneRows: Int,
         viewWidthPx: Int,
+        viewHeightPx: Int,
         minTextSize: Int,
         maxTextSize: Int,
-        charWidthAt: (textSize: Int) -> Float,
+        metricsAt: (textSize: Int) -> CellMetrics,
     ): Int {
         require(minTextSize in 1..maxTextSize) { "bad text size range $minTextSize..$maxTextSize" }
-        if (paneCols <= 0 || viewWidthPx <= 0) return maxTextSize
+        val fitCols: Boolean = paneCols > 0 && viewWidthPx > 0
+        val fitRows: Boolean = paneRows > 0 && viewHeightPx > 0
+        if (!fitCols && !fitRows) return maxTextSize
         var low: Int = minTextSize
         var high: Int = maxTextSize
         var best: Int = minTextSize
         while (low <= high) {
             val mid: Int = (low + high) / 2
-            if (paneCols * charWidthAt(mid) <= viewWidthPx) {
+            val metrics: CellMetrics = metricsAt(mid)
+            val fits: Boolean = (!fitCols || paneCols * metrics.charWidth <= viewWidthPx) &&
+                (!fitRows || metrics.heightOf(paneRows) <= viewHeightPx)
+            if (fits) {
                 best = mid
                 low = mid + 1
             } else {
@@ -64,9 +91,9 @@ object TerminalSizing {
         lineSpacingPx: Int,
         lineSpacingAndAscentPx: Int,
     ): Grid {
-        require(charWidthPx > 0f && lineSpacingPx > 0) { "bad font metrics $charWidthPx / $lineSpacingPx" }
-        val cols: Int = (viewWidthPx / charWidthPx).toInt()
-        val rows: Int = (viewHeightPx - lineSpacingAndAscentPx) / lineSpacingPx
+        val metrics = CellMetrics(charWidthPx, lineSpacingPx, lineSpacingAndAscentPx)
+        val cols: Int = (viewWidthPx / metrics.charWidth).toInt()
+        val rows: Int = metrics.rowsIn(viewHeightPx)
         return Grid(maxOf(MIN_CLIENT_COLS, cols), maxOf(MIN_CLIENT_ROWS, rows))
     }
 }

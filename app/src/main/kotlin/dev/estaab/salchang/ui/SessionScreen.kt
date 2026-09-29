@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -48,6 +49,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -65,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.ViewModelStoreOwner
 import dev.estaab.salchang.SalchangApp
+import dev.estaab.salchang.data.SettingsRepository
 import dev.estaab.salchang.meta.WindowMeta
 import dev.estaab.salchang.session.ConnectionState
 import dev.estaab.salchang.session.SessionController
@@ -73,6 +76,8 @@ import dev.estaab.salchang.session.SessionViewModel
 import dev.estaab.salchang.ssh.extractHttpsUrl
 import dev.estaab.salchang.tmuxctl.TmuxState
 import dev.estaab.salchang.tmuxctl.TmuxWindow
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 
 private val TAB_PADDING_H = 12.dp
 private val TAB_PADDING_V = 10.dp
@@ -122,7 +127,7 @@ fun SessionScreen(hostId: String, onBack: () -> Unit) {
     when {
         missingProfile -> MissingProfile(onBack)
         current == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-        else -> SessionContent(current, onBack)
+        else -> SessionContent(current, app.settings, onBack)
     }
 }
 
@@ -136,7 +141,7 @@ private fun MissingProfile(onBack: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
+private fun SessionContent(controller: SessionController, settings: SettingsRepository, onBack: () -> Unit) {
     val connection: ConnectionState by controller.connectionState.collectAsState()
     val tmux: TmuxState by controller.tmuxState.collectAsState()
     val prompt: SessionPrompt? by controller.prompt.collectAsState()
@@ -145,6 +150,12 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
     val snackbar: SnackbarHostState = remember { SnackbarHostState() }
     var subTab: Int by rememberSaveable { mutableIntStateOf(SUB_TAB_TERMINAL) }
     var windowDialog: WindowDialog? by remember { mutableStateOf(null) }
+    var extraKeysDialog: Boolean by remember { mutableStateOf(false) }
+    val extraKeysSpec: String? by settings.extraKeysSpec.collectAsState(initial = null)
+    val extraKeys: List<List<ExtraKey>> = remember(extraKeysSpec) {
+        extraKeysSpec?.let { ExtraKeysSpec.parse(it).rows } ?: ExtraKeysSpec.DEFAULT_ROWS
+    }
+    val scope: CoroutineScope = rememberCoroutineScope()
 
     LaunchedEffect(lastError) {
         val message: String = lastError ?: return@LaunchedEffect
@@ -165,6 +176,9 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
                 },
                 actions = {
                     if (prefixArmed) PrefixChip()
+                    IconButton(onClick = { extraKeysDialog = true }) {
+                        Icon(Icons.Default.Keyboard, contentDescription = "Extra keys")
+                    }
                     when (connection) {
                         is ConnectionState.Connected -> TextButton(onClick = { controller.disconnect() }) { Text("Disconnect") }
                         is ConnectionState.Connecting -> Unit
@@ -193,7 +207,7 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
             }
             if (activeWindow != null) {
                 when (subTab) {
-                    SUB_TAB_TERMINAL -> TerminalTab(controller, activeWindow, Modifier.weight(1f))
+                    SUB_TAB_TERMINAL -> TerminalTab(controller, activeWindow, extraKeys, Modifier.weight(1f))
                     else -> InfoTab(activeWindow, controller::parseMeta, Modifier.weight(1f))
                 }
             } else {
@@ -218,6 +232,14 @@ private fun SessionContent(controller: SessionController, onBack: () -> Unit) {
             fingerprintSha256 = p.fingerprintSha256,
             onAccept = { p.reply.complete(true) },
             onReject = { p.reply.complete(false) },
+        )
+    }
+
+    if (extraKeysDialog) {
+        ExtraKeysDialog(
+            spec = extraKeysSpec,
+            onSave = { spec -> scope.launch { settings.setExtraKeysSpec(spec) }; extraKeysDialog = false },
+            onDismiss = { extraKeysDialog = false },
         )
     }
 

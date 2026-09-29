@@ -44,6 +44,19 @@ the server and emulates them client-side (a `PREFIX` badge shows while the prefi
 Bindings that need tmux's interactive UI (`command-prompt`, `confirm-before`, `display-menu`,
 `choose-*`, `copy-mode`) are not supported.
 
+## Extra keys
+
+The row of keys under the terminal (Esc, Tab, Ctrl, Alt, arrows, ...) is configurable: tap the
+keyboard icon in the session's top bar. The spec is one line per row of keys, names separated by
+spaces; a single character types itself, and an empty spec hides the bar. Key names: `ESC TAB CTRL
+ALT ENTER BKSP DEL INS LEFT UP DOWN RIGHT HOME END PGUP PGDN F1`..`F12 SPACE`. The default is
+
+```
+ESC TAB CTRL ALT LEFT UP DOWN RIGHT HOME END PGUP PGDN - / |
+```
+
+`CTRL` and `ALT` are sticky: they apply to the next key or typed character.
+
 ## Optional **Info** tab setup for Claude Code
 
 1. Install `remote/salchang-statusline` on the tmux host (needs `jq`):

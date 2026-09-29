@@ -13,9 +13,9 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -29,7 +29,9 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
@@ -46,6 +48,7 @@ import com.termux.view.TerminalViewClient
 import dev.estaab.salchang.session.PaneTerminal
 import dev.estaab.salchang.session.SessionController
 import dev.estaab.salchang.session.TerminalSizing
+import dev.estaab.salchang.session.TerminalSizing.CellMetrics
 import dev.estaab.salchang.tmuxctl.TmuxPane
 import dev.estaab.salchang.tmuxctl.TmuxWindow
 import kotlin.math.ceil
@@ -53,9 +56,14 @@ import kotlin.math.ceil
 private val CHIP_ROW_PADDING = 4.dp
 private val CHIP_SPACING = 4.dp
 
-/** Terminal tab for one tmux window: pane chips, the terminal view and the extra keys bar. */
+/** Terminal tab for one tmux window: pane chips, the terminal view and the extra keys bar ([extraKeys]). */
 @Composable
-fun TerminalTab(controller: SessionController, window: TmuxWindow, modifier: Modifier = Modifier) {
+fun TerminalTab(
+    controller: SessionController,
+    window: TmuxWindow,
+    extraKeys: List<List<ExtraKey>>,
+    modifier: Modifier = Modifier,
+) {
     val panes: List<TmuxPane> = window.panes
     val activePane: TmuxPane? = panes.firstOrNull { it.id == window.activePaneId } ?: panes.firstOrNull()
     val modifiers: ModifierState = remember { ModifierState() }
@@ -87,7 +95,7 @@ fun TerminalTab(controller: SessionController, window: TmuxWindow, modifier: Mod
             }
         }
         ExtraKeysBar(
-            keys = DEFAULT_EXTRA_KEYS,
+            rows = extraKeys,
             ctrlActive = modifiers.ctrl,
             altActive = modifiers.alt,
             onKey = { key -> view?.let { sendExtraKey(it, key, modifiers) } },
@@ -135,9 +143,11 @@ private fun sendExtraKey(view: TerminalView, key: ExtraKey, modifiers: ModifierS
  *
  * Sizing: the emulator grid is pinned to the tmux pane size (`TerminalSession.setFixedSize`), so
  * the view only decides how big the cells are. The text size is the largest value in
- * [TerminalSizing.MIN_TEXT_SIZE_SP]..[TerminalSizing.MAX_TEXT_SIZE_SP] whose `paneCols * charWidth`
- * fits the viewport width; if even the minimum does not fit the view is widened past the viewport
- * and becomes horizontally scrollable. Separately, the viewport size at the preferred text size is
+ * [TerminalSizing.MIN_TEXT_SIZE_SP]..[TerminalSizing.MAX_TEXT_SIZE_SP] at which the whole
+ * `paneCols x paneRows` grid fits the viewport. If even the minimum does not fit, the view is
+ * widened past the viewport and becomes horizontally scrollable, and/or made taller than the
+ * viewport and aligned to its bottom, so the rows around the cursor stay visible and nothing is
+ * drawn under the extra keys bar. Separately, the viewport size at the preferred text size is
  * converted to a cols x rows grid and reported to tmux via [SessionController.onViewportGridChanged].
  */
 @Composable
@@ -157,25 +167,28 @@ private fun PaneView(
     LaunchedEffect(pane.id, connection) { controller.ensureTerminal(pane.id) }
 
     val paneCols: Int = pane.width.coerceAtLeast(1)
+    val paneRows: Int = pane.height.coerceAtLeast(1)
     val minPx: Int = with(density) { TerminalSizing.MIN_TEXT_SIZE_SP.sp.roundToPx() }
     val maxPx: Int = with(density) { TerminalSizing.MAX_TEXT_SIZE_SP.sp.roundToPx() }
     val preferredPx: Int = with(density) { TerminalSizing.PREFERRED_TEXT_SIZE_SP.sp.roundToPx() }
 
-    val textSizePx: Int = remember(paneCols, viewport.width, minPx, maxPx) {
-        TerminalSizing.fitTextSize(paneCols, viewport.width, minPx, maxPx) { size -> FontMetrics.at(size).charWidth }
+    val textSizePx: Int = remember(paneCols, paneRows, viewport, minPx, maxPx) {
+        TerminalSizing.fitTextSize(paneCols, paneRows, viewport.width, viewport.height, minPx, maxPx, ::cellMetricsAt)
     }
-    val charWidthPx: Float = remember(textSizePx) { FontMetrics.at(textSizePx).charWidth }
-    val contentWidthPx: Int = maxOf(viewport.width, ceil(paneCols * charWidthPx).toInt())
+    val metrics: CellMetrics = remember(textSizePx) { cellMetricsAt(textSizePx) }
+    // The view is at least the viewport; larger only when the pane does not fit at the minimum text size.
+    val contentWidthPx: Int = maxOf(viewport.width, ceil(paneCols * metrics.charWidth).toInt())
+    val contentHeightPx: Int = maxOf(viewport.height, metrics.heightOf(paneRows))
 
     LaunchedEffect(viewport, preferredPx) {
         if (viewport.width <= 0 || viewport.height <= 0) return@LaunchedEffect
-        val metrics: FontMetrics = FontMetrics.at(preferredPx)
+        val preferred: CellMetrics = cellMetricsAt(preferredPx)
         val grid: TerminalSizing.Grid = TerminalSizing.gridFor(
             viewWidthPx = viewport.width,
             viewHeightPx = viewport.height,
-            charWidthPx = metrics.charWidth,
-            lineSpacingPx = metrics.lineSpacing,
-            lineSpacingAndAscentPx = metrics.lineSpacingAndAscent,
+            charWidthPx = preferred.charWidth,
+            lineSpacingPx = preferred.lineSpacing,
+            lineSpacingAndAscentPx = preferred.lineSpacingAndAscent,
         )
         controller.onViewportGridChanged(grid.cols, grid.rows)
     }
@@ -184,7 +197,11 @@ private fun PaneView(
         Modifier
             .fillMaxSize()
             .onSizeChanged { viewport = it }
+            // Compose does not clip by default: a view taller than the viewport would paint over the tabs above.
+            .clipToBounds()
             .horizontalScroll(rememberScrollState()),
+        // A pane taller than the viewport shows its bottom rows, where the prompt and cursor are.
+        contentAlignment = Alignment.BottomStart,
     ) {
         if (terminal == null || viewport.width <= 0) return@Box
         var textSizeSet: Int by remember { mutableIntStateOf(-1) }
@@ -203,7 +220,7 @@ private fun PaneView(
                     onViewCreated(this)
                 }
             },
-            modifier = Modifier.width(with(density) { contentWidthPx.toDp() }).fillMaxHeight(),
+            modifier = Modifier.width(with(density) { contentWidthPx.toDp() }).height(with(density) { contentHeightPx.toDp() }),
             update = { view: TerminalView ->
                 if (textSizeSet != textSizePx) {
                     view.setTextSize(textSizePx)
@@ -243,18 +260,14 @@ private object FocusOnAttach : View.OnAttachStateChangeListener {
  * Cell metrics of the monospace font at a pixel text size, computed the same way as
  * `TerminalRenderer` does (which keeps its ascent package-private).
  */
-private class FontMetrics(val charWidth: Float, val lineSpacing: Int, val lineSpacingAndAscent: Int) {
-    companion object {
-        fun at(textSizePx: Int): FontMetrics {
-            val paint = Paint()
-            paint.typeface = Typeface.MONOSPACE
-            paint.isAntiAlias = true
-            paint.textSize = textSizePx.toFloat()
-            val lineSpacing: Int = ceil(paint.fontSpacing).toInt()
-            val ascent: Int = ceil(paint.ascent()).toInt()
-            return FontMetrics(paint.measureText("X"), lineSpacing, lineSpacing + ascent)
-        }
-    }
+private fun cellMetricsAt(textSizePx: Int): CellMetrics {
+    val paint = Paint()
+    paint.typeface = Typeface.MONOSPACE
+    paint.isAntiAlias = true
+    paint.textSize = textSizePx.toFloat()
+    val lineSpacing: Int = ceil(paint.fontSpacing).toInt()
+    val ascent: Int = ceil(paint.ascent()).toInt()
+    return CellMetrics(paint.measureText("X"), lineSpacing, lineSpacing + ascent)
 }
 
 /** Glue between [TerminalView] and the app: soft keyboard on tap, sticky CTRL/ALT, logging. */

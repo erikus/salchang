@@ -1,8 +1,8 @@
 package dev.estaab.salchang.ui
 
-import android.view.KeyEvent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -37,52 +37,41 @@ sealed interface ExtraKey {
 
 enum class ModifierKind { CTRL, ALT }
 
-/** Termux-style default row, left to right. */
-val DEFAULT_EXTRA_KEYS: List<ExtraKey> = listOf(
-    ExtraKey.Code("ESC", KeyEvent.KEYCODE_ESCAPE),
-    ExtraKey.Code("TAB", KeyEvent.KEYCODE_TAB),
-    ExtraKey.Modifier("CTRL", ModifierKind.CTRL),
-    ExtraKey.Modifier("ALT", ModifierKind.ALT),
-    ExtraKey.Code("←", KeyEvent.KEYCODE_DPAD_LEFT),
-    ExtraKey.Code("↑", KeyEvent.KEYCODE_DPAD_UP),
-    ExtraKey.Code("↓", KeyEvent.KEYCODE_DPAD_DOWN),
-    ExtraKey.Code("→", KeyEvent.KEYCODE_DPAD_RIGHT),
-    ExtraKey.Code("HOME", KeyEvent.KEYCODE_MOVE_HOME),
-    ExtraKey.Code("END", KeyEvent.KEYCODE_MOVE_END),
-    ExtraKey.Code("PGUP", KeyEvent.KEYCODE_PAGE_UP),
-    ExtraKey.Code("PGDN", KeyEvent.KEYCODE_PAGE_DOWN),
-    ExtraKey.Char("-", '-'.code),
-    ExtraKey.Char("/", '/'.code),
-    ExtraKey.Char("|", '|'.code),
-)
-
+/**
+ * The rows of on-screen keys under the terminal, from [ExtraKeysSpec.parse]. Each row scrolls
+ * horizontally on its own; no rows means no bar.
+ */
 @Composable
 fun ExtraKeysBar(
-    keys: List<ExtraKey>,
+    rows: List<List<ExtraKey>>,
     ctrlActive: Boolean,
     altActive: Boolean,
     onKey: (ExtraKey) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Row(
-        modifier
-            .fillMaxWidth()
-            .height(BAR_HEIGHT)
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = KEY_SPACING),
-    ) {
-        keys.forEach { key ->
-            val selected: Boolean = when (key) {
-                is ExtraKey.Modifier -> if (key.kind == ModifierKind.CTRL) ctrlActive else altActive
-                else -> false
+    if (rows.isEmpty()) return
+    Column(modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant)) {
+        rows.forEach { keys ->
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .height(BAR_HEIGHT)
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = KEY_SPACING),
+            ) {
+                keys.forEach { key ->
+                    val selected: Boolean = when (key) {
+                        is ExtraKey.Modifier -> if (key.kind == ModifierKind.CTRL) ctrlActive else altActive
+                        else -> false
+                    }
+                    FilterChip(
+                        selected = selected,
+                        onClick = { onKey(key) },
+                        label = { Text(key.label, fontFamily = FontFamily.Monospace, fontSize = KEY_LABEL_SIZE) },
+                        modifier = Modifier.padding(horizontal = KEY_SPACING / 2),
+                    )
+                }
             }
-            FilterChip(
-                selected = selected,
-                onClick = { onKey(key) },
-                label = { Text(key.label, fontFamily = FontFamily.Monospace, fontSize = KEY_LABEL_SIZE) },
-                modifier = Modifier.padding(horizontal = KEY_SPACING / 2),
-            )
         }
     }
 }

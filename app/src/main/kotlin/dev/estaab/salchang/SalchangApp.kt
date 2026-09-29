@@ -2,7 +2,9 @@ package dev.estaab.salchang
 
 import android.app.Application
 import dev.estaab.salchang.data.HostRepository
+import dev.estaab.salchang.data.SettingsRepository
 import dev.estaab.salchang.data.hostsDataStore
+import dev.estaab.salchang.data.settingsDataStore
 import dev.estaab.salchang.ssh.AndroidCrypto
 import dev.estaab.salchang.ssh.HostKeyPrompt
 import dev.estaab.salchang.ssh.KnownHosts
@@ -14,6 +16,9 @@ class SalchangApp : Application() {
     lateinit var hostRepository: HostRepository
         private set
 
+    lateinit var settings: SettingsRepository
+        private set
+
     lateinit var knownHostsFile: File
         private set
 
@@ -21,6 +26,7 @@ class SalchangApp : Application() {
         super.onCreate()
         AndroidCrypto.install()
         hostRepository = HostRepository(hostsDataStore)
+        settings = SettingsRepository(settingsDataStore)
         knownHostsFile = File(filesDir, KNOWN_HOSTS_FILE_NAME)
     }
 
