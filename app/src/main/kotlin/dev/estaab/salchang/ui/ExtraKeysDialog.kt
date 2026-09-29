@@ -64,7 +64,7 @@ fun ExtraKeysDialog(spec: String?, onSave: (String?) -> Unit, onDismiss: () -> U
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                ExtraKeysBar(rows = parsed.rows, ctrlActive = false, altActive = false, onKey = {})
+                ExtraKeysBar(rows = parsed.rows, ctrlActive = false, altActive = false, shiftActive = false, onKey = {})
                 TextButton(onClick = { text = ExtraKeysSpec.DEFAULT }, enabled = text != ExtraKeysSpec.DEFAULT) {
                     Text("Reset to default")
                 }

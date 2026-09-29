@@ -12,7 +12,7 @@ class ExtraKeysSpecTest {
         assertEquals(emptyList<String>(), result.errors)
         assertEquals(1, result.rows.size)
         assertEquals(
-            listOf("ESC", "TAB", "CTRL", "ALT", "←", "↑", "↓", "→", "HOME", "END", "PGUP", "PGDN", "-", "/", "|"),
+            listOf("ESC", "TAB", "CTRL", "ALT", "SHIFT", "←", "↑", "↓", "→", "~", "/", "\\", "-", "|"),
             result.rows.single().map { it.label },
         )
         assertEquals(result.rows, ExtraKeysSpec.DEFAULT_ROWS)
@@ -20,23 +20,25 @@ class ExtraKeysSpecTest {
 
     @Test
     fun namesAreCaseInsensitiveAndAliased() {
-        val row: List<ExtraKey> = ExtraKeysSpec.parse("esc Escape pageup ← control F10").rows.single()
+        val row: List<ExtraKey> = ExtraKeysSpec.parse("esc Escape pageup ← control F10 shift").rows.single()
         assertEquals(ExtraKey.Code("ESC", KeyEvent.KEYCODE_ESCAPE), row[0])
         assertEquals(row[0], row[1])
         assertEquals(ExtraKey.Code("PGUP", KeyEvent.KEYCODE_PAGE_UP), row[2])
         assertEquals(ExtraKey.Code("←", KeyEvent.KEYCODE_DPAD_LEFT), row[3])
         assertEquals(ExtraKey.Modifier("CTRL", ModifierKind.CTRL), row[4])
         assertEquals(ExtraKey.Code("F10", KeyEvent.KEYCODE_F10), row[5])
+        assertEquals(ExtraKey.Modifier("SHIFT", ModifierKind.SHIFT), row[6])
     }
 
     @Test
     fun singleCharactersTypeThemselves() {
-        val row: List<ExtraKey> = ExtraKeysSpec.parse("- ~ é 😀 space").rows.single()
+        val row: List<ExtraKey> = ExtraKeysSpec.parse("- ~ \\ é 😀 space").rows.single()
         assertEquals(ExtraKey.Char("-", '-'.code), row[0])
         assertEquals(ExtraKey.Char("~", '~'.code), row[1])
-        assertEquals(ExtraKey.Char("é", 0xE9), row[2])
-        assertEquals(ExtraKey.Char("😀", 0x1F600), row[3])
-        assertEquals(ExtraKey.Char("SPACE", ' '.code), row[4])
+        assertEquals(ExtraKey.Char("\\", '\\'.code), row[2])
+        assertEquals(ExtraKey.Char("é", 0xE9), row[3])
+        assertEquals(ExtraKey.Char("😀", 0x1F600), row[4])
+        assertEquals(ExtraKey.Char("SPACE", ' '.code), row[5])
     }
 
     @Test

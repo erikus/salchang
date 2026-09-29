@@ -8,8 +8,8 @@ import android.view.KeyEvent
  * [ExtraKeysSpec.NAMES] (case-insensitive) or a single character, which is typed literally.
  */
 object ExtraKeysSpec {
-    /** The Termux-style default row. */
-    const val DEFAULT: String = "ESC TAB CTRL ALT LEFT UP DOWN RIGHT HOME END PGUP PGDN - / |"
+    /** The default row: modifiers, arrows and the shell characters that are awkward on a phone keyboard. */
+    const val DEFAULT: String = "ESC TAB CTRL ALT SHIFT LEFT UP DOWN RIGHT ~ / \\ - |"
 
     /** Rows of the parsed [DEFAULT]. */
     val DEFAULT_ROWS: List<List<ExtraKey>> by lazy { parse(DEFAULT).rows }
@@ -21,6 +21,7 @@ object ExtraKeysSpec {
         fun code(name: String, label: String, keyCode: Int) = put(name, ExtraKey.Code(label, keyCode))
         put("CTRL", ExtraKey.Modifier("CTRL", ModifierKind.CTRL))
         put("ALT", ExtraKey.Modifier("ALT", ModifierKind.ALT))
+        put("SHIFT", ExtraKey.Modifier("SHIFT", ModifierKind.SHIFT))
         code("ESC", "ESC", KeyEvent.KEYCODE_ESCAPE)
         code("TAB", "TAB", KeyEvent.KEYCODE_TAB)
         code("ENTER", "ENTER", KeyEvent.KEYCODE_ENTER)

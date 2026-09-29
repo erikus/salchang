@@ -25,7 +25,7 @@ private val KEY_LABEL_SIZE = 12.sp
 sealed interface ExtraKey {
     val label: String
 
-    /** Sends a key code through `TerminalView.handleKeyCode`, honouring the CTRL/ALT toggles. */
+    /** Sends a key code through `TerminalView.handleKeyCode`, honouring the CTRL/ALT/SHIFT toggles. */
     data class Code(override val label: String, val keyCode: Int) : ExtraKey
 
     /** Sends a literal character through `TerminalView.inputCodePoint`, honouring the toggles. */
@@ -35,7 +35,7 @@ sealed interface ExtraKey {
     data class Modifier(override val label: String, val kind: ModifierKind) : ExtraKey
 }
 
-enum class ModifierKind { CTRL, ALT }
+enum class ModifierKind { CTRL, ALT, SHIFT }
 
 /**
  * The rows of on-screen keys under the terminal, from [ExtraKeysSpec.parse]. Each row scrolls
@@ -46,6 +46,7 @@ fun ExtraKeysBar(
     rows: List<List<ExtraKey>>,
     ctrlActive: Boolean,
     altActive: Boolean,
+    shiftActive: Boolean,
     onKey: (ExtraKey) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -61,7 +62,11 @@ fun ExtraKeysBar(
             ) {
                 keys.forEach { key ->
                     val selected: Boolean = when (key) {
-                        is ExtraKey.Modifier -> if (key.kind == ModifierKind.CTRL) ctrlActive else altActive
+                        is ExtraKey.Modifier -> when (key.kind) {
+                            ModifierKind.CTRL -> ctrlActive
+                            ModifierKind.ALT -> altActive
+                            ModifierKind.SHIFT -> shiftActive
+                        }
                         else -> false
                     }
                     FilterChip(

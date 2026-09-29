@@ -98,21 +98,33 @@ fun TerminalTab(
             rows = extraKeys,
             ctrlActive = modifiers.ctrl,
             altActive = modifiers.alt,
+            shiftActive = modifiers.shift,
             onKey = { key -> view?.let { sendExtraKey(it, key, modifiers) } },
         )
     }
 }
 
-/** Sticky CTRL/ALT toggles shared by the extra keys bar and the [TerminalViewClient]. */
+/** Sticky CTRL/ALT/SHIFT toggles shared by the extra keys bar and the [TerminalViewClient]. */
 class ModifierState {
     var ctrl: Boolean by mutableStateOf(false)
     var alt: Boolean by mutableStateOf(false)
+    var shift: Boolean by mutableStateOf(false)
 
-    /** Reads and clears both toggles. */
-    fun consume(): Pair<Boolean, Boolean> {
-        val result = Pair(ctrl, alt)
+    /** The toggles read by [consume]. */
+    data class Held(val ctrl: Boolean, val alt: Boolean, val shift: Boolean) {
+        /** `KeyHandler.KEYMOD_*` bits for `TerminalView.handleKeyCode`. */
+        val keyMod: Int
+            get() = (if (ctrl) KeyHandler.KEYMOD_CTRL else 0) or
+                (if (alt) KeyHandler.KEYMOD_ALT else 0) or
+                (if (shift) KeyHandler.KEYMOD_SHIFT else 0)
+    }
+
+    /** Reads and clears all toggles. */
+    fun consume(): Held {
+        val result = Held(ctrl, alt, shift)
         ctrl = false
         alt = false
+        shift = false
         return result
     }
 }
@@ -123,17 +135,14 @@ private fun sendExtraKey(view: TerminalView, key: ExtraKey, modifiers: ModifierS
         is ExtraKey.Modifier -> when (key.kind) {
             ModifierKind.CTRL -> modifiers.ctrl = !modifiers.ctrl
             ModifierKind.ALT -> modifiers.alt = !modifiers.alt
+            ModifierKind.SHIFT -> modifiers.shift = !modifiers.shift
         }
-        is ExtraKey.Code -> {
-            val (ctrl: Boolean, alt: Boolean) = modifiers.consume()
-            var keyMod = 0
-            if (ctrl) keyMod = keyMod or KeyHandler.KEYMOD_CTRL
-            if (alt) keyMod = keyMod or KeyHandler.KEYMOD_ALT
-            view.handleKeyCode(key.keyCode, keyMod)
-        }
+        is ExtraKey.Code -> view.handleKeyCode(key.keyCode, modifiers.consume().keyMod)
         is ExtraKey.Char -> {
-            val (ctrl: Boolean, alt: Boolean) = modifiers.consume()
-            view.inputCodePoint(TerminalView.KEY_EVENT_SOURCE_VIRTUAL_KEYBOARD, key.codePoint, ctrl, alt)
+            val held: ModifierState.Held = modifiers.consume()
+            // Same as TerminalView does for typed text while the sticky shift is on.
+            val codePoint: Int = if (held.shift) Character.toUpperCase(key.codePoint) else key.codePoint
+            view.inputCodePoint(TerminalView.KEY_EVENT_SOURCE_VIRTUAL_KEYBOARD, codePoint, held.ctrl, held.alt)
         }
     }
 }
@@ -270,7 +279,7 @@ private fun cellMetricsAt(textSizePx: Int): CellMetrics {
     return CellMetrics(paint.measureText("X"), lineSpacing, lineSpacing + ascent)
 }
 
-/** Glue between [TerminalView] and the app: soft keyboard on tap, sticky CTRL/ALT, logging. */
+/** Glue between [TerminalView] and the app: soft keyboard on tap, sticky CTRL/ALT/SHIFT, logging. */
 private class PaneViewClient(private val view: TerminalView, private val modifiers: ModifierState) : TerminalViewClient {
     override fun onScale(scale: Float): Float = 1f
 
@@ -291,7 +300,7 @@ private class PaneViewClient(private val view: TerminalView, private val modifie
 
     override fun readControlKey(): Boolean = modifiers.ctrl
     override fun readAltKey(): Boolean = modifiers.alt
-    override fun readShiftKey(): Boolean = false
+    override fun readShiftKey(): Boolean = modifiers.shift
     override fun readFnKey(): Boolean = false
 
     override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: TerminalSession): Boolean {
