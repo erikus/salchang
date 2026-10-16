@@ -15,7 +15,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.requiredHeight
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -186,6 +186,8 @@ private fun PaneView(
     }
     val metrics: CellMetrics = remember(textSizePx) { cellMetricsAt(textSizePx) }
     // The view is at least the viewport; larger only when the pane does not fit at the minimum text size.
+    // The height must be a required size: the Box below bounds its children to the viewport height
+    // (only the width is unbounded, by the horizontal scroll), and a plain height() would be clamped.
     val contentWidthPx: Int = maxOf(viewport.width, ceil(paneCols * metrics.charWidth).toInt())
     val contentHeightPx: Int = maxOf(viewport.height, metrics.heightOf(paneRows))
 
@@ -229,7 +231,7 @@ private fun PaneView(
                     onViewCreated(this)
                 }
             },
-            modifier = Modifier.width(with(density) { contentWidthPx.toDp() }).height(with(density) { contentHeightPx.toDp() }),
+            modifier = Modifier.width(with(density) { contentWidthPx.toDp() }).requiredHeight(with(density) { contentHeightPx.toDp() }),
             update = { view: TerminalView ->
                 if (textSizeSet != textSizePx) {
                     view.setTextSize(textSizePx)
